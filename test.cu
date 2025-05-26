@@ -1,9 +1,9 @@
 #include <helper_matrix.h>
 #include <helper_string.h>
-#include <cublas_v2.h> // Added for Hybrid Strassen
+#include <cublas_v2.h> 
 #include <sgemm.cuh>
 #include <sgemm_strassen_fused.cuh> 
-#include <sgemm_hybrid_2level.cuh> // Added for Hybrid Strassen
+#include <sgemm_hybrid_2level_vC.cuh> // Updated to vC for Hybrid Strassen
 #include <string>
 
 #include <filesystem>
@@ -195,13 +195,52 @@ main(int argc, char** argv) {
         checkCudaErrors(cudaFree(d_B_ref));
         checkCudaErrors(cudaFree(d_C_ref));
 
-        // --- Strassen Calculation ---
-        // sgemm_strassen_1level_fused_vP takes alpha and beta by value
-        // It needs h_C_initial as input, and writes to h_C_strassen_out
-        checkCudaErrors(cudaMemcpy(h_C_strassen_out, h_C_initial, m * ldc * sizeof(float), cudaMemcpyHostToHost)); // Prepare input C for Strassen
-        // Call the Version P launcher
-        sgemm_strassen_1level_fused_vP(m, n, k, alpha_val, h_A, lda, h_B, ldb, beta_val, h_C_strassen_out, ldc, 0); // Using default stream 0
-        // sgemm_strassen_1level_fused_vP calls cudaStreamSynchronize internally
+        // --- Strassen Calculation (using refactored sgemm_strassen_1level_fused_vP with device pointers) ---
+        float* d_A_strassen = alloc_mat_device(m * lda * sizeof(float));
+        float* d_B_strassen = alloc_mat_device(k * ldb * sizeof(float));
+        float* d_C_strassen_inout = alloc_mat_device(m * ldc * sizeof(float));
+        cudaStream_t stream_strassen_1L = 0; // Use default stream
+
+        checkCudaErrors(cudaMemcpy2DAsync(d_A_strassen, lda * sizeof(float), h_A, lda * sizeof(float), k * sizeof(float), m, cudaMemcpyHostToDevice, stream_strassen_1L));
+        checkCudaErrors(cudaMemcpy2DAsync(d_B_strassen, ldb * sizeof(float), h_B, ldb * sizeof(float), n * sizeof(float), k, cudaMemcpyHostToDevice, stream_strassen_1L));
+
+        if (beta_val != 0.0f) {
+            // If beta is not 0, copy initial C content to device.
+            // sgemm_strassen_1level_fused_vP will use it as input if beta_val=1.0f.
+            // If beta_val is other non-zero, sgemm_strassen_1level_fused_vP expects C_dev to be pre-scaled by caller.
+            // For this test, we assume if beta_val is non-zero, it's typically 1.0 for accumulation,
+            // or the test checks against a reference that handles arbitrary beta.
+            // The reference sgemm correctly handles arbitrary beta.
+            // So, we provide h_C_initial for non-zero beta.
+            checkCudaErrors(cudaMemcpy2DAsync(d_C_strassen_inout, ldc * sizeof(float), h_C_initial, ldc * sizeof(float), n * sizeof(float), m, cudaMemcpyHostToDevice, stream_strassen_1L));
+        }
+        // If beta_val == 0.0f, sgemm_strassen_1level_fused_vP will cudaMemsetAsync d_C_strassen_inout.
+        
+        // cublas_handle was created for hybrid tests; it's named cublas_handle there.
+        // Here, the test section for 1-level Strassen is before hybrid, so use its own handle if needed,
+        // or assume one is available (e.g. cublas_handle_for_hybrid created earlier).
+        // For now, use the one from the hybrid section, assuming it's created at a higher scope or passed.
+        // The prior diff added `cublas_handle_for_hybrid` globally in main.
+        sgemm_strassen_1level_fused_vP(m, n, k, 
+                                     alpha_val,         // alpha_sub (typically 1.0 for this usage)
+                                     d_A_strassen, lda, 
+                                     d_B_strassen, ldb, 
+                                     beta_val,          // beta_sub
+                                     d_C_strassen_inout, ldc, 
+                                     cublas_handle_for_hybrid, // Pass the handle
+                                     stream_strassen_1L);
+        
+        checkCudaErrors(cudaStreamSynchronize(stream_strassen_1L)); // Wait for Strassen kernels to complete
+
+        // Copy result back to h_C_strassen_out
+        checkCudaErrors(cudaMemcpy2DAsync(h_C_strassen_out, ldc * sizeof(float), d_C_strassen_inout, ldc * sizeof(float), n * sizeof(float), m, cudaMemcpyDeviceToHost, stream_strassen_1L));
+        checkCudaErrors(cudaStreamSynchronize(stream_strassen_1L)); // Wait for D2H to complete
+
+        checkCudaErrors(cudaFreeAsync(d_A_strassen, stream_strassen_1L));
+        checkCudaErrors(cudaFreeAsync(d_B_strassen, stream_strassen_1L));
+        checkCudaErrors(cudaFreeAsync(d_C_strassen_inout, stream_strassen_1L));
+        // Final sync for frees if stream is not default, though not strictly needed here before comparison
+        if(stream_strassen_1L != 0) checkCudaErrors(cudaStreamSynchronize(stream_strassen_1L));
 
         // --- Comparison ---
         // Compare h_C_ref_gpu_out (from reference GPU sgemm) with h_C_strassen_out
@@ -324,8 +363,11 @@ main(int argc, char** argv) {
         checkCudaErrors(cudaFree(d_C_ref));
 
         // --- Hybrid Strassen Calculation ---
-        checkCudaErrors(cudaMemcpy(h_C_hybrid_out, h_C_initial, m * ldc * sizeof(float), cudaMemcpyHostToHost)); 
-        sgemm_strassen_hybrid_2level(m, n, k, alpha_val, h_A, lda, h_B, ldb, beta_val, h_C_hybrid_out, ldc, cublas_handle, 0);
+        checkCudaErrors(cudaMemcpy(h_C_hybrid_out, h_C_initial, m * ldc * sizeof(float), cudaMemcpyHostToHost));
+        cudaStream_t stream_hybrid_vc = 0; // Using default stream as per original test structure for hybrid
+        // cudaStreamCreate(&stream_hybrid_vc); // Or create a new stream
+        sgemm_strassen_hybrid_2level_vC(m, n, k, alpha_val, h_A, lda, h_B, ldb, beta_val, h_C_hybrid_out, ldc, cublas_handle, stream_hybrid_vc);
+        // if (stream_hybrid_vc != 0) cudaStreamDestroy(stream_hybrid_vc);
         
         // --- Comparison ---
         // Epsilon might need to be slightly larger for Strassen due to different operation order

@@ -4,7 +4,7 @@
 #include <helper_string.h>
 #include <sgemm.cuh>
 #include <sgemm_strassen_fused.cuh> // For Strassen vP
-#include <sgemm_hybrid_2level.cuh>  // For Hybrid 2-Level Strassen
+#include <sgemm_hybrid_2level_vC.cuh>  // For Hybrid 2-Level Strassen (Version C)
 
 #include <filesystem>
 #include <fstream>
@@ -28,9 +28,9 @@ main(int argc, char** argv) {
         args.push_back(string{argv[i]});
     }
 
-    // Ensure cuBLAS handle is always created for Hybrid Strassen
-    cublasHandle_t cublas_handle_for_hybrid;
-    checkCudaErrors(cublasCreate(&cublas_handle_for_hybrid));
+    // Ensure cuBLAS handle is always created for Hybrid Strassen and refactored 1-Level Strassen
+    cublasHandle_t cublas_handle_main; // Renamed for general use
+    checkCudaErrors(cublasCreate(&cublas_handle_main));
 
     int matsize_min = get_cmd_line_arg_int(args, "mmin", MATSIZE_MIN_DEFAULT);
     int matsize_step = get_cmd_line_arg_int(args, "mstep", MATSIZE_STEP_DEFAULT);
@@ -118,13 +118,13 @@ main(int argc, char** argv) {
 
     // Output file for benchmark results
     fs::path work_dir_path = fs::current_path();
-    fs::path store_benchmark_path = work_dir_path / save_dir / "all_sgemm_benchmarks.txt"; // Updated filename
+    fs::path store_benchmark_path = work_dir_path / save_dir / "all_sgemm_benchmarks_final.txt"; 
     std::ofstream benchmark_file(store_benchmark_path);
-    benchmark_file << "M,N,K,SGEMM_Time_ms,Strassen_1L_Time_ms,Hybrid_2L_Time_ms,Speedup_1L,Speedup_2L\n"; // Updated header
+    benchmark_file << "M,N,K,SGEMM_Time_ms,Strassen_1L_vP_GPU_Time_ms,Strassen_2L_Hybrid_Full_Time_ms,Speedup_1L_GPU,Speedup_2L_Full\n";
 
 
     printf("%.*s\n", sep_len, "===================================================");
-    printf("Benchmark: SGEMM vs Strassen 1-Level (vP) vs Strassen 2-Level Hybrid\n"); // Updated title
+    printf("Benchmark: SGEMM vs Strassen 1-Level (vP, GPU-centric) vs Strassen 2-Level Hybrid (Full)\n"); 
     printf("Alpha: %.1f, Beta: %.1f, Iterations per size: %d\n", alpha, beta, NUM_ITERATIONS);
     printf("%.*s\n", sep_len, "===================================================");
 
@@ -144,25 +144,21 @@ main(int argc, char** argv) {
 
         float* h_A = alloc_mat_host(m * lda * sizeof(float));
         float* h_B = alloc_mat_host(k * ldb * sizeof(float));
-        // h_C_for_strassen is used as output for Strassen. Beta=0, so its initial content doesn't matter.
-        float* h_C_for_strassen = alloc_mat_host(m * ldc * sizeof(float));
-        float* h_C_for_hybrid = alloc_mat_host(m * ldc * sizeof(float)); // For Hybrid Strassen output
-        // d_C_ref is used as output for reference sgemm.
-        float* d_C_ref = alloc_mat_device(m * ldc * sizeof(float));
-
-
-        float* d_A = alloc_mat_device(m * lda * sizeof(float));
-        float* d_B = alloc_mat_device(k * ldb * sizeof(float));
+        float* h_C_for_strassen_1L_dummy = alloc_mat_host(m * ldc * sizeof(float)); // Not strictly needed if not verifying output
+        float* h_C_for_hybrid = alloc_mat_host(m * ldc * sizeof(float)); 
         
+        float* d_C_ref = alloc_mat_device(m * ldc * sizeof(float)); // For sgemm output
+        float* d_A_main = alloc_mat_device(m * lda * sizeof(float)); // Renamed from d_A
+        float* d_B_main = alloc_mat_device(k * ldb * sizeof(float)); // Renamed from d_B
+        float* d_C_1L_out = alloc_mat_device(m * ldc * sizeof(float)); // For 1-Level Strassen GPU output
+
         init_random(h_A, m * lda);
         init_random(h_B, k * ldb);
-        // No need to init h_C_for_strassen as beta=0.0f for Strassen call here.
-        // No need to init or copy d_C_ref as beta=0.0f for sgemm call. Kernels should handle output only.
 
-        checkCudaErrors(cudaMemcpy(d_A, h_A, m * lda * sizeof(float), cudaMemcpyHostToDevice));
-        checkCudaErrors(cudaMemcpy(d_B, h_B, k * ldb * sizeof(float), cudaMemcpyHostToDevice));
-        // For beta=0, d_C_ref does not need to be copied from host. It will be overwritten.
-        // For Strassen, h_C_for_strassen is an output parameter. Its input state is handled by sgemm_strassen_1level_fused_vP based on beta.
+        // Copy A & B to device once for sgemm and 1-Level Strassen (GPU-centric)
+        checkCudaErrors(cudaMemcpy(d_A_main, h_A, m * lda * sizeof(float), cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMemcpy(d_B_main, h_B, k * ldb * sizeof(float), cudaMemcpyHostToDevice));
+        // For beta=0, d_C_ref and d_C_1L_out do not need pre-initialization.
 
         cudaEvent_t start_event, stop_event;
         checkCudaErrors(cudaEventCreate(&start_event));
@@ -192,30 +188,30 @@ main(int argc, char** argv) {
         checkCudaErrors(cudaEventElapsedTime(&elapsed_time_ms, start_event, stop_event));
         sgemm_avg_times[i] = elapsed_time_ms / NUM_ITERATIONS;
 
-        // --- Benchmark Strassen sgemm_strassen_1level_fused_vP ---
-        // Warm-up for Strassen (takes host pointers)
-        // h_C_for_strassen will be overwritten. Its input content for beta=0 is handled by the launcher.
-        sgemm_strassen_1level_fused_vP(m, n, k, alpha, h_A, lda, h_B, ldb, beta, h_C_for_strassen, ldc, 0);
-        checkCudaErrors(cudaDeviceSynchronize()); // Ensure warmup is complete as Strassen vP has its own sync
+        // --- Benchmark Strassen 1-Level sgemm_strassen_1level_fused_vP (GPU-centric) ---
+        // Warm-up (operates on device pointers d_A_main, d_B_main, d_C_1L_out)
+        // beta is 0.0f, so d_C_1L_out will be zeroed by the function.
+        sgemm_strassen_1level_fused_vP(m, n, k, alpha, d_A_main, lda, d_B_main, ldb, beta, d_C_1L_out, ldc, cublas_handle_main, 0);
+        checkCudaErrors(cudaDeviceSynchronize()); 
 
         checkCudaErrors(cudaEventRecord(start_event, 0));
         for (int iter = 0; iter < NUM_ITERATIONS; ++iter) {
-            sgemm_strassen_1level_fused_vP(m, n, k, alpha, h_A, lda, h_B, ldb, beta, h_C_for_strassen, ldc, 0);
+            sgemm_strassen_1level_fused_vP(m, n, k, alpha, d_A_main, lda, d_B_main, ldb, beta, d_C_1L_out, ldc, cublas_handle_main, 0);
         }
         checkCudaErrors(cudaEventRecord(stop_event, 0));
         checkCudaErrors(cudaEventSynchronize(stop_event));
         checkCudaErrors(cudaEventElapsedTime(&elapsed_time_ms, start_event, stop_event));
-        strassen_avg_times[i] = elapsed_time_ms / NUM_ITERATIONS;
+        strassen_avg_times[i] = elapsed_time_ms / NUM_ITERATIONS; // This is now Strassen_1L_vP_GPU
         
         
-        // --- Benchmark Hybrid 2-Level Strassen ---
-        // Warm-up for Hybrid Strassen (takes host pointers)
-        sgemm_strassen_hybrid_2level(m, n, k, alpha, h_A, lda, h_B, ldb, beta, h_C_for_hybrid, ldc, cublas_handle_for_hybrid, 0);
+        // --- Benchmark Hybrid 2-Level Strassen (sgemm_strassen_hybrid_2level_vC - Full H2D/D2H) ---
+        // Warm-up for Hybrid Strassen (takes host pointers h_A, h_B, h_C_for_hybrid)
+        sgemm_strassen_hybrid_2level_vC(m, n, k, alpha, h_A, lda, h_B, ldb, beta, h_C_for_hybrid, ldc, cublas_handle_main, 0);
         checkCudaErrors(cudaDeviceSynchronize());
 
         checkCudaErrors(cudaEventRecord(start_event, 0));
         for (int iter = 0; iter < NUM_ITERATIONS; ++iter) {
-            sgemm_strassen_hybrid_2level(m, n, k, alpha, h_A, lda, h_B, ldb, beta, h_C_for_hybrid, ldc, cublas_handle_for_hybrid, 0);
+            sgemm_strassen_hybrid_2level_vC(m, n, k, alpha, h_A, lda, h_B, ldb, beta, h_C_for_hybrid, ldc, cublas_handle_main, 0);
         }
         checkCudaErrors(cudaEventRecord(stop_event, 0));
         checkCudaErrors(cudaEventSynchronize(stop_event));
@@ -226,22 +222,23 @@ main(int argc, char** argv) {
         checkCudaErrors(cudaEventDestroy(start_event));
         checkCudaErrors(cudaEventDestroy(stop_event));
 
-        double speedup_1L = strassen_avg_times[i] > 0 ? (sgemm_avg_times[i] / strassen_avg_times[i]) : 0;
-        double speedup_2L = hybrid_strassen_avg_times[i] > 0 ? (sgemm_avg_times[i] / hybrid_strassen_avg_times[i]) : 0;
+        double speedup_1L_gpu = strassen_avg_times[i] > 0 ? (sgemm_avg_times[i] / strassen_avg_times[i]) : 0;
+        double speedup_2L_full = hybrid_strassen_avg_times[i] > 0 ? (sgemm_avg_times[i] / hybrid_strassen_avg_times[i]) : 0;
 
-        printf("Size: %dx%dx%d, SGEMM: %.3f ms, Strassen_1L_vP: %.3f ms, Strassen_2L_Hybrid: %.3f ms, Speedup_1L: %.2fx, Speedup_2L: %.2fx\n",
-               m, n, k, sgemm_avg_times[i], strassen_avg_times[i], hybrid_strassen_avg_times[i], speedup_1L, speedup_2L);
+        printf("Size: %dx%dx%d, SGEMM: %.3f ms, Strassen_1L_vP_GPU: %.3f ms, Strassen_2L_Hybrid_Full: %.3f ms, Speedup_1L_GPU: %.2fx, Speedup_2L_Full: %.2fx\n",
+               m, n, k, sgemm_avg_times[i], strassen_avg_times[i], hybrid_strassen_avg_times[i], speedup_1L_gpu, speedup_2L_full);
         benchmark_file << m << "," << n << "," << k << ","
                        << sgemm_avg_times[i] << "," << strassen_avg_times[i] << "," << hybrid_strassen_avg_times[i] << ","
-                       << speedup_1L << "," << speedup_2L << "\n";
+                       << speedup_1L_gpu << "," << speedup_2L_full << "\n";
         
         checkCudaErrors(cudaFreeHost(h_A));
         checkCudaErrors(cudaFreeHost(h_B));
-        checkCudaErrors(cudaFreeHost(h_C_for_strassen));
-        checkCudaErrors(cudaFreeHost(h_C_for_hybrid)); // Free hybrid C output buffer
-        checkCudaErrors(cudaFree(d_A));
-        checkCudaErrors(cudaFree(d_B));
+        checkCudaErrors(cudaFreeHost(h_C_for_strassen_1L_dummy)); // Was h_C_for_strassen
+        checkCudaErrors(cudaFreeHost(h_C_for_hybrid)); 
+        checkCudaErrors(cudaFree(d_A_main)); // Was d_A
+        checkCudaErrors(cudaFree(d_B_main)); // Was d_B
         checkCudaErrors(cudaFree(d_C_ref));
+        checkCudaErrors(cudaFree(d_C_1L_out)); // Free new device buffer for 1L Strassen
         
         if (matsize == MATSIZE_MAX_DEFAULT && npts == NPTS_DEFAULT) break; // ensure loop terminates if max reached early
     }
@@ -251,11 +248,11 @@ main(int argc, char** argv) {
     printf("%.*s\n", sep_len, "===================================================");
 
 #if CUBLAS == 1
-    // If the main CUBLAS handle 'handle' was used by sgemm, destroy it.
-    // The hybrid Strassen uses cublas_handle_for_hybrid.
+    // If the main CUBLAS handle 'handle' was used by sgemm (if CUBLAS==1), destroy it.
+    // The cublas_handle_main is used by Strassen versions.
     checkCudaErrors(cublasDestroy(handle)); 
 #endif
-    checkCudaErrors(cublasDestroy(cublas_handle_for_hybrid)); // Destroy the dedicated handle for hybrid
+    checkCudaErrors(cublasDestroy(cublas_handle_main)); // Destroy the main handle
 
     return 0;
 }
