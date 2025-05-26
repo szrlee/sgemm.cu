@@ -81,3 +81,37 @@ l2flush() {
         checkCudaErrors(cudaFree(m_l2_buffer));
     }
 }
+
+// New error checking macros that throw exceptions (Version D requirement)
+#include <stdexcept> // For std::runtime_error
+#include <string>    // For error messages (though snprintf uses char arrays)
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call)                                         \
+do {                                                             \
+    cudaError_t err = call;                                      \
+    if (err != cudaSuccess) {                                    \
+        char error_buff[512];                                    \
+        snprintf(error_buff, sizeof(error_buff), "CUDA Error at %s:%d - %s", __FILE__, \
+                __LINE__, cudaGetErrorString(err));              \
+        fprintf(stderr, "%s\n", error_buff);                     \
+        throw std::runtime_error(error_buff);                    \
+    }                                                            \
+} while (0)
+#endif
+
+#ifndef CUBLAS_CHECK
+#define CUBLAS_CHECK(call)                                             \
+do {                                                                   \
+    cublasStatus_t status = call;                                      \
+    if (status != CUBLAS_STATUS_SUCCESS) {                             \
+        char error_buff[512];                                          \
+        /* Using existing _cudaGetErrorEnum for cuBLAS status to string */ \
+        const char* status_str = _cudaGetErrorEnum(status);            \
+        snprintf(error_buff, sizeof(error_buff), "cuBLAS Error at %s:%d - %s (Code: %d)",      \
+                __FILE__, __LINE__, status_str, status);               \
+        fprintf(stderr, "%s\n", error_buff);                           \
+        throw std::runtime_error(error_buff);                          \
+    }                                                                  \
+} while (0)
+#endif
