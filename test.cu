@@ -1,7 +1,9 @@
 #include <helper_matrix.h>
 #include <helper_string.h>
+#include <cublas_v2.h> // Added for Hybrid Strassen
 #include <sgemm.cuh>
-#include <sgemm_strassen_fused.cuh> // Added for Strassen fused
+#include <sgemm_strassen_fused.cuh> 
+#include <sgemm_hybrid_2level.cuh> // Added for Hybrid Strassen
 #include <string>
 
 #include <filesystem>
@@ -233,9 +235,135 @@ main(int argc, char** argv) {
     test_full_info += strassen_test_summary;   // Append Strassen summary
 
     // Now write all results to file
+    // test_results_file << test_full_info.c_str(); // Keep open for Hybrid Strassen results
+    // test_results_file.close();                 // Will be closed after hybrid tests
+    // printf("All test results stored in %s\n", store_path.c_str());
+
+
+    // --- cuBLAS Handle for Hybrid Strassen ---
+    cublasHandle_t cublas_handle;
+    cublasStatus_t cublas_status = cublasCreate(&cublas_handle);
+    if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "CUBLAS initialization failed!\n");
+        // Close the file before exiting if it was opened
+        if (test_results_file.is_open()) {
+            test_results_file.close();
+        }
+        return -1; 
+    }
+
+    // --- Test Hybrid 2-Level Strassen SGEMM ---
+    printf("%.*s\n", sep_len, "===================================================");
+    printf("Testing Hybrid 2-Level Strassen SGEMM...\n");
+    printf("%.*s\n", sep_len, "===================================================");
+
+    struct HybridStrassenTestConfig {
+        int M, N, K;
+        float beta;
+        string id;
+    };
+
+    std::vector<HybridStrassenTestConfig> hybrid_configs = {
+        {64, 64, 64, 0.0f, "Hybrid_64x64x64_beta0"},
+        {64, 64, 64, 0.75f, "Hybrid_64x64x64_beta0.75"},
+        {128, 128, 128, 0.0f, "Hybrid_128x128x128_beta0"},
+        {128, 128, 128, 0.75f, "Hybrid_128x128x128_beta0.75"},
+        {256, 256, 128, 0.0f, "Hybrid_256x256x128_beta0"}, // M,N,K div by 4
+        {256, 256, 128, 0.75f, "Hybrid_256x256x128_beta0.75"},
+        {128, 256, 256, 0.0f, "Hybrid_128x256x256_beta0"},
+        {128, 256, 256, 0.75f, "Hybrid_128x256x256_beta0.75"},
+        {512, 512, 512, 0.0f, "Hybrid_512x512x512_beta0"},
+        {512, 512, 512, 0.75f, "Hybrid_512x512x512_beta0.75"}
+    };
+
+    string hybrid_test_summary = "\n=============== HYBRID STRASSEN SUMMARY ===============\n";
+    string hybrid_test_full_info = "";
+    int hybrid_n_tests = hybrid_configs.size();
+    int hybrid_n_failed = 0;
+
+    for (int i = 0; i < hybrid_n_tests; ++i) {
+        const auto& cfg = hybrid_configs[i];
+        size_t m = cfg.M, n = cfg.N, k = cfg.K;
+        float beta_val = cfg.beta;
+        float alpha_val = 1.0f; 
+
+        size_t lda = k;
+        size_t ldb = n;
+        size_t ldc = n;
+
+        printf("Running Hybrid Strassen Test: ID=%s, M=%zu, N=%zu, K=%zu, beta=%.2f, alpha=%.2f\n", 
+               cfg.id.c_str(), m, n, k, beta_val, alpha_val);
+
+        float* h_A = alloc_mat_host(m * lda * sizeof(float));
+        float* h_B = alloc_mat_host(k * ldb * sizeof(float));
+        float* h_C_initial = alloc_mat_host(m * ldc * sizeof(float));
+        float* h_C_ref_gpu_out = alloc_mat_host(m * ldc * sizeof(float)); 
+        float* h_C_hybrid_out = alloc_mat_host(m * ldc * sizeof(float)); 
+
+        init_random(h_A, m * lda);
+        init_random(h_B, k * ldb);
+        init_random(h_C_initial, m * ldc);
+
+        // --- Reference Calculation (using GPU sgemm from sgemm.cuh) ---
+        float* d_A_ref = alloc_mat_device(m * lda * sizeof(float));
+        float* d_B_ref = alloc_mat_device(k * ldb * sizeof(float));
+        float* d_C_ref = alloc_mat_device(m * ldc * sizeof(float));
+
+        checkCudaErrors(cudaMemcpy(d_A_ref, h_A, m * lda * sizeof(float), cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMemcpy(d_B_ref, h_B, k * ldb * sizeof(float), cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMemcpy(d_C_ref, h_C_initial, m * ldc * sizeof(float), cudaMemcpyHostToDevice));
+        
+        sgemm(m, n, k, &alpha_val, d_A_ref, lda, d_B_ref, ldb, &beta_val, d_C_ref, ldc);
+        checkCudaErrors(cudaGetLastError()); 
+        checkCudaErrors(cudaDeviceSynchronize()); 
+
+        checkCudaErrors(cudaMemcpy(h_C_ref_gpu_out, d_C_ref, m * ldc * sizeof(float), cudaMemcpyDeviceToHost));
+
+        checkCudaErrors(cudaFree(d_A_ref));
+        checkCudaErrors(cudaFree(d_B_ref));
+        checkCudaErrors(cudaFree(d_C_ref));
+
+        // --- Hybrid Strassen Calculation ---
+        checkCudaErrors(cudaMemcpy(h_C_hybrid_out, h_C_initial, m * ldc * sizeof(float), cudaMemcpyHostToHost)); 
+        sgemm_strassen_hybrid_2level(m, n, k, alpha_val, h_A, lda, h_B, ldb, beta_val, h_C_hybrid_out, ldc, cublas_handle, 0);
+        
+        // --- Comparison ---
+        // Epsilon might need to be slightly larger for Strassen due to different operation order
+        cmp_result result = compare_mats(h_C_ref_gpu_out, h_C_hybrid_out, m * ldc, 1e-3f, false, true); 
+        string result_string{};
+        if (!result.equal) {
+            hybrid_n_failed += 1;
+            result_string = "FAILED";
+        } else {
+            result_string = "PASSED";
+        }
+        printf("Hybrid Strassen Test ID=%s | %s (Max Abs Diff: %e, Rel Diff: %e)\n", 
+               cfg.id.c_str(), result_string.c_str(), result.max_abs_diff, result.max_rel_diff);
+
+        hybrid_test_full_info += "Hybrid Strassen Test ID=" + cfg.id + ": " + result.debug_info;
+        
+        checkCudaErrors(cudaFreeHost(h_A));
+        checkCudaErrors(cudaFreeHost(h_B));
+        checkCudaErrors(cudaFreeHost(h_C_initial));
+        checkCudaErrors(cudaFreeHost(h_C_ref_gpu_out));
+        checkCudaErrors(cudaFreeHost(h_C_hybrid_out));
+    }
+
+    hybrid_test_summary += "PASSED: " + to_string(hybrid_n_tests - hybrid_n_failed) + " / " + to_string(hybrid_n_tests) + "\n";
+    if (hybrid_n_failed > 0) {
+        hybrid_test_summary += "SOME HYBRID STRASSEN TESTS FAILED.\n";
+    }
+    printf("%s", hybrid_test_summary.c_str());
+
+    test_full_info += hybrid_test_full_info; 
+    test_full_info += hybrid_test_summary;   
+
+    // Now write all combined results to file
     test_results_file << test_full_info.c_str();
     test_results_file.close();
     printf("All test results stored in %s\n", store_path.c_str());
+
+    cublasDestroy(cublas_handle); // Destroy cuBLAS handle
 
     return 0;
 }
