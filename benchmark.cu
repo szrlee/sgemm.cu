@@ -3,6 +3,7 @@
 #include <helper_matrix.h>
 #include <helper_string.h>
 #include <sgemm.cuh>
+#include <sgemm_strassen_fused.cuh> // For Strassen vP
 
 #include <filesystem>
 #include <fstream>
@@ -10,11 +11,11 @@
 namespace fs = std::filesystem;
 using string = std::string;
 
-#define MATSIZE_MIN_DEFAULT    1024
-#define MATSIZE_STEP_DEFAULT   512
-#define NPTS_DEFAULT           21
-#define WARMUP_MATSIZE_DEFAULT 4096
-#define WARMUP_NITER_DEFAULT   500
+#define MATSIZE_MIN_DEFAULT    512  // Changed for Strassen benchmark range
+#define MATSIZE_STEP_DEFAULT   256  // Changed for more points
+#define NPTS_DEFAULT           15   // (4096-512)/256 + 1 = 15 points to reach 4096
+#define WARMUP_MATSIZE_DEFAULT 2048 // Adjusted warmup size
+#define WARMUP_NITER_DEFAULT   10   // Reduced warmup iterations for faster testing cycle
 #define SAVEDIR_DEFAULT        "benchmark_results"
 #define FILE_NAME_DEFAULT      "sgemm.cu"
 
@@ -104,106 +105,126 @@ main(int argc, char** argv) {
         checkCudaErrors(cudaFree(C_device));
     }
 
-    std::vector<int> avg_gflops(npts, 0);
+    std::vector<double> sgemm_avg_times(npts, 0.0);
+    std::vector<double> strassen_avg_times(npts, 0.0);
     std::vector<int> matsizes(npts, 0);
+    const int NUM_ITERATIONS = 10; // Number of iterations for timing loop
+
+    // Output file for benchmark results
+    fs::path work_dir_path = fs::current_path();
+    fs::path store_benchmark_path = work_dir_path / save_dir / "strassen_vs_sgemm_benchmark.txt";
+    std::ofstream benchmark_file(store_benchmark_path);
+    benchmark_file << "M,N,K,SGEMM_Time_ms,Strassen_Time_ms,Speedup\n";
+
 
     printf("%.*s\n", sep_len, "===================================================");
-    printf("Benchmark\n");
+    printf("Benchmark: Standard SGEMM vs Strassen Fused SGEMM\n");
+    printf("Alpha: %.1f, Beta: %.1f, Iterations per size: %d\n", alpha, beta, NUM_ITERATIONS);
     printf("%.*s\n", sep_len, "===================================================");
+
     for (int i = 0; i < npts; i++) {
         int matsize = matsize_min + i * matsize_step;
+        if (matsize > MATSIZE_MAX_DEFAULT && npts == NPTS_DEFAULT) { // Cap at default max if using default npts
+             matsize = MATSIZE_MAX_DEFAULT;
+             if (i > 0 && matsizes[i-1] == MATSIZE_MAX_DEFAULT) break; // Avoid duplicate max size
+        }
+        if (matsize == 0) continue; // Should not happen with new defaults
+
         matsizes[i] = matsize;
         int m = matsize, n = matsize, k = matsize;
         int lda = k, ldb = n, ldc = n;
 
-        float* A_host = alloc_mat_host(m * lda * sizeof(float));
-        float* B_host = alloc_mat_host(k * ldb * sizeof(float));
-        float* C_host = alloc_mat_host(m * ldc * sizeof(float));
+        printf("Benchmarking Size: M=%d, N=%d, K=%d\n", m, n, k);
 
-        float* A_device = alloc_mat_device(m * lda * sizeof(float));
-        float* B_device = alloc_mat_device(k * ldb * sizeof(float));
-        float* C_device = alloc_mat_device(m * ldc * sizeof(float));
+        float* h_A = alloc_mat_host(m * lda * sizeof(float));
+        float* h_B = alloc_mat_host(k * ldb * sizeof(float));
+        // h_C_for_strassen is used as output for Strassen. Beta=0, so its initial content doesn't matter.
+        float* h_C_for_strassen = alloc_mat_host(m * ldc * sizeof(float)); 
+        // d_C_ref is used as output for reference sgemm.
+        float* d_C_ref = alloc_mat_device(m * ldc * sizeof(float));
 
-        init_random(A_host, m * lda);
-        init_random(B_host, k * ldb);
-        init_random(C_host, m * ldc);
 
-        checkCudaErrors(
-            cudaMemcpy(A_device, A_host, m * lda * sizeof(float), cudaMemcpyHostToDevice));
-        checkCudaErrors(
-            cudaMemcpy(B_device, B_host, k * ldb * sizeof(float), cudaMemcpyHostToDevice));
-        checkCudaErrors(
-            cudaMemcpy(C_device, C_host, m * ldc * sizeof(float), cudaMemcpyHostToDevice));
+        float* d_A = alloc_mat_device(m * lda * sizeof(float));
+        float* d_B = alloc_mat_device(k * ldb * sizeof(float));
+        
+        init_random(h_A, m * lda);
+        init_random(h_B, k * ldb);
+        // No need to init h_C_for_strassen as beta=0.0f for Strassen call here.
+        // No need to init or copy d_C_ref as beta=0.0f for sgemm call. Kernels should handle output only.
 
-        size_t FLOP = 2 * (size_t)m * n * k;
-        double GFLOP = FLOP * 1e-9f;
+        checkCudaErrors(cudaMemcpy(d_A, h_A, m * lda * sizeof(float), cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMemcpy(d_B, h_B, k * ldb * sizeof(float), cudaMemcpyHostToDevice));
+        // For beta=0, d_C_ref does not need to be copied from host. It will be overwritten.
+        // For Strassen, h_C_for_strassen is an output parameter. Its input state is handled by sgemm_strassen_1level_fused_vP based on beta.
 
-        int n_iter = std::max((int)(1000*exp((-matsize + matsize_min)/3100.0)), 4);
-        std::vector<float> elapsed_time_ms(n_iter, 0);
+        cudaEvent_t start_event, stop_event;
+        checkCudaErrors(cudaEventCreate(&start_event));
+        checkCudaErrors(cudaEventCreate(&stop_event));
+        float elapsed_time_ms;
 
-        cudaEvent_t start, stop;
-        checkCudaErrors(cudaEventCreate(&start));
-        checkCudaErrors(cudaEventCreate(&stop));
-
-        for (int j = 0; j < n_iter; j++) {
-            checkCudaErrors(cudaEventRecord(start));
+        // --- Benchmark Standard sgemm (from sgemm.cuh) ---
 #if CUBLAS == 1
-            cublasSgemm(handle,
-                        CUBLAS_OP_N,
-                        CUBLAS_OP_N,
-                        n,
-                        m,
-                        k,
-                        &alpha,
-                        B_device,
-                        ldb,
-                        A_device,
-                        lda,
-                        &beta,
-                        C_device,
-                        ldc);
+        // Warm-up for cuBLAS
+        cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, d_B, ldb, d_A, lda, &beta, d_C_ref, ldc);
 #else
-            sgemm(m, n, k, &alpha, A_device, lda, B_device, ldb, &beta, C_device, ldc);
+        // Warm-up for sgemm
+        sgemm(m, n, k, &alpha, d_A, lda, d_B, ldb, &beta, d_C_ref, ldc);
 #endif
-            checkCudaErrors(cudaEventRecord(stop));
-            checkCudaErrors(cudaEventSynchronize(stop));
-            checkCudaErrors(cudaEventElapsedTime(&elapsed_time_ms[j], start, stop));
-            checkCudaErrors(cudaGetLastError());
-            // Flush L2 cache
-            l2flush();
+        checkCudaErrors(cudaDeviceSynchronize());
+
+        checkCudaErrors(cudaEventRecord(start_event, 0));
+        for (int iter = 0; iter < NUM_ITERATIONS; ++iter) {
+#if CUBLAS == 1
+            cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, d_B, ldb, d_A, lda, &beta, d_C_ref, ldc);
+#else
+            sgemm(m, n, k, &alpha, d_A, lda, d_B, ldb, &beta, d_C_ref, ldc);
+#endif
         }
+        checkCudaErrors(cudaEventRecord(stop_event, 0));
+        checkCudaErrors(cudaEventSynchronize(stop_event));
+        checkCudaErrors(cudaEventElapsedTime(&elapsed_time_ms, start_event, stop_event));
+        sgemm_avg_times[i] = elapsed_time_ms / NUM_ITERATIONS;
 
-        float avg_elapsed_time_ms = 0;
-        int midpoint_idx = n_iter / 2;
-        for (int j = midpoint_idx; j < n_iter; j++) {
-            avg_elapsed_time_ms += elapsed_time_ms[j];
+        // --- Benchmark Strassen sgemm_strassen_1level_fused_vP ---
+        // Warm-up for Strassen (takes host pointers)
+        // h_C_for_strassen will be overwritten. Its input content for beta=0 is handled by the launcher.
+        sgemm_strassen_1level_fused_vP(m, n, k, alpha, h_A, lda, h_B, ldb, beta, h_C_for_strassen, ldc, 0);
+        checkCudaErrors(cudaDeviceSynchronize()); // Ensure warmup is complete as Strassen vP has its own sync
+
+        checkCudaErrors(cudaEventRecord(start_event, 0));
+        for (int iter = 0; iter < NUM_ITERATIONS; ++iter) {
+            sgemm_strassen_1level_fused_vP(m, n, k, alpha, h_A, lda, h_B, ldb, beta, h_C_for_strassen, ldc, 0);
         }
-        avg_elapsed_time_ms = avg_elapsed_time_ms / (n_iter - midpoint_idx);
+        checkCudaErrors(cudaEventRecord(stop_event, 0));
+        checkCudaErrors(cudaEventSynchronize(stop_event));
+        checkCudaErrors(cudaEventElapsedTime(&elapsed_time_ms, start_event, stop_event));
+        strassen_avg_times[i] = elapsed_time_ms / NUM_ITERATIONS;
+        
+        checkCudaErrors(cudaEventDestroy(start_event));
+        checkCudaErrors(cudaEventDestroy(stop_event));
 
-        avg_gflops[i] = (int)(GFLOP / (avg_elapsed_time_ms * 1e-3));
-
-        checkCudaErrors(cudaFreeHost(A_host));
-        checkCudaErrors(cudaFreeHost(B_host));
-        checkCudaErrors(cudaFreeHost(C_host));
-        checkCudaErrors(cudaFree(A_device));
-        checkCudaErrors(cudaFree(B_device));
-        checkCudaErrors(cudaFree(C_device));
-        checkCudaErrors(cudaEventDestroy(start));
-        checkCudaErrors(cudaEventDestroy(stop));
-
-        printf("m=n=k=%i:\n", matsize);
-        printf("%s %*i GFLOP/s\n", file_name.c_str(), 8, avg_gflops[i]);
-        printf("\n");
+        printf("Size: %dx%dx%d, SGEMM: %.3f ms, Strassen_vP: %.3f ms, Speedup: %.2fx\n",
+               m, n, k, sgemm_avg_times[i], strassen_avg_times[i], sgemm_avg_times[i] / strassen_avg_times[i]);
+        benchmark_file << m << "," << n << "," << k << ","
+                       << sgemm_avg_times[i] << "," << strassen_avg_times[i] << ","
+                       << (strassen_avg_times[i] > 0 ? (sgemm_avg_times[i] / strassen_avg_times[i]) : 0) << "\n";
+        
+        checkCudaErrors(cudaFreeHost(h_A));
+        checkCudaErrors(cudaFreeHost(h_B));
+        checkCudaErrors(cudaFreeHost(h_C_for_strassen));
+        checkCudaErrors(cudaFree(d_A));
+        checkCudaErrors(cudaFree(d_B));
+        checkCudaErrors(cudaFree(d_C_ref));
+        
+        if (matsize == MATSIZE_MAX_DEFAULT && npts == NPTS_DEFAULT) break; // ensure loop terminates if max reached early
     }
-
-    fs::path work_dir_path = fs::current_path();
-    fs::path store_sgemm_path = work_dir_path / save_dir / (file_name + ".txt");
-    std::ofstream sgemm_file(store_sgemm_path);
-    for (int i = 0; i < npts; i++) {
-        sgemm_file << matsizes[i] << " " << avg_gflops[i] << '\n';
-    }
-    printf("Benchmark data stored in %s\n", store_sgemm_path.c_str());
-    sgemm_file.close();
+    
+    benchmark_file.close();
+    printf("Benchmark data stored in %s\n", store_benchmark_path.c_str());
     printf("%.*s\n", sep_len, "===================================================");
+
+#if CUBLAS == 1
+    checkCudaErrors(cublasDestroy(handle));
+#endif
     return 0;
 }

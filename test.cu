@@ -194,11 +194,12 @@ main(int argc, char** argv) {
         checkCudaErrors(cudaFree(d_C_ref));
 
         // --- Strassen Calculation ---
-        // sgemm_strassen_1level_fused takes alpha and beta by value
+        // sgemm_strassen_1level_fused_vP takes alpha and beta by value
         // It needs h_C_initial as input, and writes to h_C_strassen_out
         checkCudaErrors(cudaMemcpy(h_C_strassen_out, h_C_initial, m * ldc * sizeof(float), cudaMemcpyHostToHost)); // Prepare input C for Strassen
-        sgemm_strassen_1level_fused(m, n, k, alpha_val, h_A, lda, h_B, ldb, beta_val, h_C_strassen_out, ldc);
-        // sgemm_strassen_1level_fused already calls cudaDeviceSynchronize where needed internally
+        // Call the Version P launcher
+        sgemm_strassen_1level_fused_vP(m, n, k, alpha_val, h_A, lda, h_B, ldb, beta_val, h_C_strassen_out, ldc, 0); // Using default stream 0
+        // sgemm_strassen_1level_fused_vP calls cudaStreamSynchronize internally
 
         // --- Comparison ---
         // Compare h_C_ref_gpu_out (from reference GPU sgemm) with h_C_strassen_out

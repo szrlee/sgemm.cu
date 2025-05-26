@@ -1,513 +1,288 @@
-#include "helper_cuda_ptx.h"
+#ifndef STRASSEN_FUSED_128X128X8_KERNEL_CUH_
+#define STRASSEN_FUSED_128X128X8_KERNEL_CUH_
+
+#include <cstdio> // For printf in kernel if needed for debugging
 #include <cstdint>
+#include "common/helper_cuda ptx.h" // Corrected path
 
-template<int DELTA, int EPSILON, int GAMMA0_IS_ONE, int GAMMA1_SIGN>
-// DELTA: 0 for no Y, 1 for +Y, -1 for -Y
-// EPSILON: 0 for no W, 1 for +W, -1 for -W
-// GAMMA0_IS_ONE: 1 if gamma0 is 1.0f. Assume gamma0 is always 1.0f for D updates.
-// GAMMA1_SIGN: 0 for no E update, 1 for +E, -1 for -E
-__global__ void strassen_fused_kernel(
-    int m_sub, int n_sub, int k_sub,
-    const float* X_ptr, int ldx,
-    const float* Y_ptr, int ldy,
-    const float* V_ptr, int ldv,
-    const float* W_ptr, int ldw,
-    float* D_ptr, int ldd,
-    float* E_ptr, int lde) {
-    // Operands X, Y, V, W, D, E: row-major format
+// Tile dimensions (fixed for this kernel)
+constexpr int M_TILE_SIZE = 128;
+constexpr int N_TILE_SIZE = 128;
+constexpr int K_TILE_SIZE = 8; // K-depth processed by one iteration of the main loop using one set of shared mem buffers
 
-    // Abbreviations:
-    // ldg - load global
-    // lds - load shared
-    // stg - store global
-    // sts - store shared
-    // cvta - convert address
+// Shared memory layout parameters for A and B tiles
+constexpr int SMEM_A_ROWS = M_TILE_SIZE; // e.g., 128 rows for A tile
+constexpr int SMEM_A_COLS = K_TILE_SIZE; // e.g., 8 columns for A tile
+constexpr int SMEM_A_LD_PADDING = 4; // Padding for leading dimension of A in shared mem (e.g., 8+4=12)
+constexpr int SMEM_A_ELEMENTS_PER_TILE = SMEM_A_ROWS * (SMEM_A_COLS + SMEM_A_LD_PADDING); // Total elements for one A tile buffer
 
-    const int smem_a_padding = 256;
-    const int smem_a_size = smem_a_padding * 8;
-    const int smem_a_ld = 132; // leading dimension
-    const int smem_b_padding = 128;
-    const int smem_b_size = smem_b_padding * 8;
-    const int smem_b_ld = 128; // leading dimension
+constexpr int SMEM_B_ROWS = K_TILE_SIZE; // e.g., 8 rows for B tile
+constexpr int SMEM_B_COLS = N_TILE_SIZE; // e.g., 128 columns for B tile
+// No padding usually needed for B if it's read column-wise for MMA, or if STS is simple.
+// The original sgemm_128x128x8.cuh uses: smem_b_ld = 128 (no padding)
+constexpr int SMEM_B_LD_PADDING = 0;
+constexpr int SMEM_B_ELEMENTS_PER_TILE = SMEM_B_ROWS * (SMEM_B_COLS + SMEM_B_LD_PADDING); // Total elements for one B tile buffer
 
-    __shared__ float __align__(2 * smem_a_size * sizeof(float))
-        smem_ptr[2 * (smem_a_size + smem_b_size)];
+// Double buffered shared memory: 2 tiles for A, 2 for B
+// Kernel will use dynamically allocated shared memory. The host launcher will calculate this size.
+extern __shared__ float smem_storage[];
 
+
+// Helper function to get coefficient value based on template parameter
+// (0 -> 0.0f, 1 -> 1.0f, -1 -> -1.0f)
+__device__ inline float get_strassen_coeff_val(int coeff_template_param) {
+    if (coeff_template_param == 0) return 0.0f;
+    if (coeff_template_param == 1) return 1.0f;
+    // if (coeff_template_param == -1) return -1.0f;
+    return -1.0f; // Defaulting for -1 or any other non-zero/one value
+}
+
+
+template<
+    int DELTA_XY_COEFF, // 0: X, 1: X+Y, -1: X-Y
+    int EPSILON_VW_COEFF, // 0: V, 1: V+W, -1: V-W
+    int GAMMA0_DEST_COEFF, // Coeff for D_ptr output (0, 1, -1)
+    int GAMMA1_DEST_COEFF  // Coeff for E_ptr output (0, 1, -1)
+>
+__global__
+__launch_bounds__(256, 2) // Standard for this tile size
+void strassen_fused_kernel_128x128x8_vP(
+    int m_sub, int n_sub, int k_sub,      // Sub-problem dimensions (M, N, K for this call)
+    const float* X_ptr, int ldx,         // Input X matrix
+    const float* Y_ptr, int ldy,         // Input Y matrix
+    const float* V_ptr, int ldv,         // Input V matrix
+    const float* W_ptr, int ldw,         // Input W matrix
+    float* D_ptr, int ldd,               // Output D matrix
+    float* E_ptr, int lde                // Output E matrix
+) {
+    // Shared memory pointers
+    float* tile_A_fused_smem[2];
+    tile_A_fused_smem[0] = smem_storage;
+    tile_A_fused_smem[1] = smem_storage + SMEM_A_ELEMENTS_PER_TILE;
+
+    float* tile_B_fused_smem[2];
+    tile_B_fused_smem[0] = smem_storage + 2 * SMEM_A_ELEMENTS_PER_TILE;
+    tile_B_fused_smem[1] = smem_storage + 2 * SMEM_A_ELEMENTS_PER_TILE + SMEM_B_ELEMENTS_PER_TILE;
+    
+    // --- Start of code from original sgemm_128x128x8.cuh, adapted ---
     // C accumulator
-    float accumulator[8][8]{};
+    float accumulator[8][8]{}; // Each thread computes an 8x8 tile of the output C (D or E)
 
     // Registers for (global memory -> shared memory) transfers
     float ldg_X_buffer[4];
-    float ldg_Y_buffer[4];
+    float ldg_Y_buffer[4]; // Only used if DELTA_XY_COEFF != 0
     float ldg_V_buffer[4];
-    float ldg_W_buffer[4];
+    float ldg_W_buffer[4]; // Only used if EPSILON_VW_COEFF != 0
 
     // Bitmasks to track in-bounds and out-of-bounds global memory reads
-    unsigned ldg_X_bitmask = 0x0; // For X and Y reads
-    unsigned ldg_V_bitmask = 0x0; // For V and W reads
-
-    float* tile_A_fused = smem_ptr; // For X + delta*Y
-    float* tile_B_fused = smem_ptr + 2 * smem_a_size; // For V + epsilon*W
+    unsigned ldg_X_Y_m_guard_bitmask = 0x0; // For X and Y reads, m-dimension guard
+    unsigned ldg_V_W_n_guard_bitmask = 0x0; // For V and W reads, n-dimension guard
 
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
 
-    // --- Setup for X and Y loading (replaces A loading) ---
-    int ldg_X_start_k_dim = threadIdx.x % 8; // k-dimension component of X
-    int ldg_X_start_m_dim = blockIdx.y * 128 + 4 * (threadIdx.x / 8); // m-dimension component of X
-    int ldg_X_start = ldg_X_start_k_dim + ldg_X_start_m_dim * ldx;
-    const float* ldg_X_global_ptr = X_ptr + ldg_X_start;
-    const float* ldg_Y_global_ptr = Y_ptr + ldg_X_start_k_dim + ldg_X_start_m_dim * ldy; // Y uses same k, m indices but its own ldy
+    // --- Setup for X and Y loading (Tile A loading: X + delta*Y) ---
+    // Each thread loads 4 elements for X and potentially 4 for Y along K-dimension over M-dimension
+    int ldg_XY_k_offset_in_tile = threadIdx.x % K_TILE_SIZE; // 0..7, which k-element in the 8-element deep tile
+    int ldg_XY_m_start_block = blockIdx.y * M_TILE_SIZE; // Starting M-dim row for this CUDA block
+    // Each group of K_TILE_SIZE threads (e.g., 8 threads) loads one "row" of the A tile (128 elements high in M, 1 element deep in K)
+    int ldg_XY_m_base_thread_group = (threadIdx.x / K_TILE_SIZE) * 4; // Base M-offset for this thread group (0, 4, 8 .. up to 124 for 256 threads / 8 k_threads_per_group)
+                                                                 // Max threadIdx.x = 255. Max (255/8)*4 = 31*4 = 124. OK.
+    
+    const float* ldg_X_global_base_ptr = X_ptr + ldg_XY_m_start_block * ldx + ldg_XY_k_offset_in_tile;
+    const float* ldg_Y_global_base_ptr = Y_ptr + ldg_XY_m_start_block * ldy + ldg_XY_k_offset_in_tile;
 
-    int ldg_XY_offsets_m[4]; // m-dimension offsets for X and Y
-    int ldg_X_offsets_global[4]; // global memory offsets for X
-    int ldg_Y_offsets_global[4]; // global memory offsets for Y
-#pragma unroll
+    // Offsets for the 4 M-elements each thread handles
+    int ldg_XY_m_offsets_vals[4];
+    #pragma unroll
     for (int i = 0; i < 4; i++) {
-        ldg_XY_offsets_m[i] = i;
-    }
-#pragma unroll
-    for (int i = 0; i < 4; i++) {
-        ldg_X_offsets_global[i] = ldg_XY_offsets_m[i] * ldx;
-        if constexpr (DELTA != 0) {
-            ldg_Y_offsets_global[i] = ldg_XY_offsets_m[i] * ldy;
+        ldg_XY_m_offsets_vals[i] = ldg_XY_m_base_thread_group + i;
+        if ((ldg_XY_m_start_block + ldg_XY_m_offsets_vals[i]) < m_sub) {
+            ldg_X_Y_m_guard_bitmask |= (1 << i);
         }
     }
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        int current_m_idx = ldg_X_start_m_dim + ldg_XY_offsets_m[i];
-        // if global memory access is in-bounds for m_sub, flip corresponding bit
-        if (current_m_idx < m_sub) { ldg_X_bitmask ^= (0x1 << i); }
-    }
+    
+    // --- Setup for V and W loading (Tile B loading: V + epsilon*W) ---
+    // Each thread loads 4 elements for V (and pot. W) along N-dim over K-dim
+    int ldg_VW_k_base_thread_group = (threadIdx.x / 32); // K-dim row for this warp (0..7)
+    int ldg_VW_n_start_block = blockIdx.x * N_TILE_SIZE; // Starting N-dim col for this CUDA block
+    int ldg_VW_n_base_thread_in_warp = threadIdx.x % 32; // N-dim base offset within the warp (0..31)
 
-    // --- Setup for V and W loading (replaces B loading) ---
-    int ldg_V_start_n_dim = blockIdx.x * 128 + threadIdx.x % 32; // n-dimension component of V
-    int ldg_V_start_k_dim = threadIdx.x / 32; // k-dimension component of V
-    int ldg_V_start = ldg_V_start_n_dim + ldg_V_start_k_dim * ldv;
-    const float* ldg_V_global_ptr = V_ptr + ldg_V_start;
-    const float* ldg_W_global_ptr = W_ptr + ldg_V_start_n_dim + ldg_V_start_k_dim * ldw; // W uses same n, k indices but its own ldw
+    const float* ldg_V_global_base_ptr = V_ptr + ldg_VW_k_base_thread_group * ldv + ldg_VW_n_start_block;
+    const float* ldg_W_global_base_ptr = W_ptr + ldg_VW_k_base_thread_group * ldw + ldg_VW_n_start_block;
 
-    int ldg_VW_offsets_n[4]; // n-dimension offsets for V and W
-    int ldg_V_offsets_global[4]; // global memory offsets for V
-    int ldg_W_offsets_global[4]; // global memory offsets for W
-#pragma unroll
-    for (int i = 0; i < 4; i++) {
-        ldg_VW_offsets_n[i] = 32 * i;
-    }
-#pragma unroll
-    for (int i = 0; i < 4; i++) {
-        ldg_V_offsets_global[i] = ldg_VW_offsets_n[i];
-        if constexpr (EPSILON != 0) {
-            ldg_W_offsets_global[i] = ldg_VW_offsets_n[i];
+    int ldg_VW_n_offsets_vals[4];
+    #pragma unroll
+    for (int i=0; i<4; ++i) {
+        ldg_VW_n_offsets_vals[i] = ldg_VW_n_base_thread_in_warp + i * 32; // Strides of 32 to cover N_TILE_SIZE=128 cols
+        if ((ldg_VW_n_start_block + ldg_VW_n_offsets_vals[i]) < n_sub) {
+            ldg_V_W_n_guard_bitmask |= (1 << i);
         }
     }
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        int current_n_idx = ldg_V_start_n_dim + ldg_VW_offsets_n[i];
-        // if global memory access is in-bounds for n_sub, flip corresponding bit
-        if (current_n_idx < n_sub) { ldg_V_bitmask ^= (0x1 << i); }
-    }
 
-    // Shared memory store pointers for tile_A_fused and tile_B_fused
-    int sts_a_start_x = 4 * (threadIdx.x / 8); // m-dimension in shared
-    int sts_a_start_y = threadIdx.x % 8;       // k-dimension in shared
-    int sts_a_start = sts_a_start_x + sts_a_start_y * smem_a_ld;
-    float* sts_tile_A_fused_ptr = tile_A_fused + sts_a_start;
+    // Shared memory store pointers
+    // For tile A (X+dY): threads store elements column-wise into shared memory (matching K-dim)
+    // SMEM_A_COLS = K_TILE_SIZE (e.g. 8), SMEM_A_LD_PADDING (e.g. 4), effective_smem_a_ld = 12
+    int sts_XY_m_offset = ldg_XY_m_base_thread_group; // Base M-dim row in shared memory tile for this thread's writes
+    int sts_XY_k_offset = ldg_XY_k_offset_in_tile;    // K-dim col in shared memory tile
+    float* sts_tile_A_fused_smem_ptr_base = tile_A_fused_smem[0] + sts_XY_m_offset * (SMEM_A_COLS + SMEM_A_LD_PADDING) + sts_XY_k_offset;
 
-    int sts_b_start_x = threadIdx.x % 32;      // n-dimension in shared
-    int sts_b_start_y = threadIdx.x / 32;      // k-dimension in shared
-    int sts_b_start = sts_b_start_x + sts_b_start_y * smem_b_ld;
-    float* sts_tile_B_fused_ptr = tile_B_fused + sts_b_start;
-    int sts_b_offsets[4];
-#pragma unroll
-    for (int i = 0; i < 4; i++) {
-        sts_b_offsets[i] = 32 * i;
-    }
+    // For tile B (V+eW): threads store elements row-wise into shared memory
+    // SMEM_B_ROWS = K_TILE_SIZE (e.g. 8), SMEM_B_COLS = N_TILE_SIZE (e.g. 128)
+    int sts_VW_k_offset = ldg_VW_k_base_thread_group; // K-dim row in shared memory tile
+    int sts_VW_n_offset = ldg_VW_n_base_thread_in_warp; // N-dim col in shared memory tile (base for 4 elements)
+    float* sts_tile_B_fused_smem_ptr_base = tile_B_fused_smem[0] + sts_VW_k_offset * (SMEM_B_COLS + SMEM_B_LD_PADDING) + sts_VW_n_offset;
+    
+    float delta_coeff = get_strassen_coeff_val(DELTA_XY_COEFF);
+    float epsilon_coeff = get_strassen_coeff_val(EPSILON_VW_COEFF);
 
-    uint64_t sts_a_addr;
-    uint64_t sts_b_addr;
+    int num_k_tiles = (k_sub + K_TILE_SIZE - 1) / K_TILE_SIZE;
+    int smem_buffer_idx = 0; // Start with buffer 0 for STS, compute on buffer 1 (pre-filled if k_tile_iter > 0)
 
-    // Convert from generic to .shared state space
-    CVTA_TO_SHARED_PTX(sts_a_addr, sts_tile_A_fused_ptr);
-    CVTA_TO_SHARED_PTX(sts_b_addr, sts_tile_B_fused_ptr);
-
-    // if (k_sub % 8 == 0) {n_blocks_k = k_sub/8 - 1} else {n_blocks_k = k_sub/8;}
-    int n_blocks_k = (k_sub + 7) / 8 - 1;
-    int first_block_k_size = k_sub - 8 * n_blocks_k;
-
-    // Load first blocks from global memory to shared memory (X+delta*Y and V+epsilon*W)
-    // {
-    float temp_ldg_X_buffer[4]; // Temporary buffer for STS128_PTX which needs 4 distinct float args
-    float temp_ldg_V_buffer[4]; // Temporary buffer for STS operations on V+epsilon*W
-
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        bool guard_k_X = ldg_X_start_k_dim < first_block_k_size;
-        bool guard_m_XY = ldg_X_bitmask & (0x1 << i); // Use ldg_X_bitmask for Y as well, as m_sub is the bounding dimension
-        bool guard_X = guard_k_X && guard_m_XY;
-        LDG32_GUARD_MOV0_PTX(ldg_X_buffer[i], ldg_X_global_ptr + ldg_X_offsets_global[i], (unsigned)guard_X);
-        if constexpr (DELTA != 0) {
-            bool guard_k_Y = ldg_X_start_k_dim < first_block_k_size; // Y shares k-dim with X
-            // guard_m_XY already covers Y's m-dimension check
-            bool guard_Y = guard_k_Y && guard_m_XY;
-            LDG32_GUARD_MOV0_PTX(ldg_Y_buffer[i], ldg_Y_global_ptr + ldg_Y_offsets_global[i], (unsigned)guard_Y);
-            temp_ldg_X_buffer[i] = ldg_X_buffer[i] + (float)DELTA * ldg_Y_buffer[i];
-        } else {
-            temp_ldg_X_buffer[i] = ldg_X_buffer[i];
+    // --- Main K-loop ---
+    for (int k_tile_iter = 0; k_tile_iter < num_k_tiles; ++k_tile_iter) {
+        int current_k_block_start_offset_in_K = k_tile_iter * K_TILE_SIZE; // k offset for global pointers
+        
+        // Determine actual K elements for this tile (handling last potentially partial tile)
+        int k_elements_in_this_physical_tile = K_TILE_SIZE;
+        if (k_tile_iter == num_k_tiles - 1) { // If it's the last tile
+            k_elements_in_this_physical_tile = k_sub - current_k_block_start_offset_in_K;
         }
-    }
-    STS128_PTX(temp_ldg_X_buffer[0], temp_ldg_X_buffer[1], temp_ldg_X_buffer[2], temp_ldg_X_buffer[3], sts_a_addr);
 
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        bool guard_k_V = ldg_V_start_k_dim < first_block_k_size;
-        bool guard_n_VW = ldg_V_bitmask & (0x1 << i); // Use ldg_V_bitmask for W as well
-        bool guard_V = guard_k_V && guard_n_VW;
-        LDG32_GUARD_MOV0_PTX(ldg_V_buffer[i], ldg_V_global_ptr + ldg_V_offsets_global[i], (unsigned)guard_V);
-        if constexpr (EPSILON != 0) {
-            bool guard_k_W = ldg_V_start_k_dim < first_block_k_size; // W shares k-dim with V
-            // guard_n_VW already covers W's n-dimension check
-            bool guard_W = guard_k_W && guard_n_VW;
-            LDG32_GUARD_MOV0_PTX(ldg_W_buffer[i], ldg_W_global_ptr + ldg_W_offsets_global[i], (unsigned)guard_W);
-            temp_ldg_V_buffer[i] = ldg_V_buffer[i] + (float)EPSILON * ldg_W_buffer[i];
-        } else {
-            temp_ldg_V_buffer[i] = ldg_V_buffer[i];
+        // --- Load data from Global to Shared Memory (current STS buffer) ---
+        uint64_t sts_smem_A_addr_u64, sts_smem_B_addr_u64;
+        CVTA_TO_SHARED_PTX(sts_smem_A_addr_u64, sts_tile_A_fused_smem_ptr_base + smem_buffer_idx * SMEM_A_ELEMENTS_PER_TILE);
+        CVTA_TO_SHARED_PTX(sts_smem_B_addr_u64, sts_tile_B_fused_smem_ptr_base + smem_buffer_idx * SMEM_B_ELEMENTS_PER_TILE);
+
+        // Guard for k-dimension on global loads
+        bool k_guard_XY = (ldg_XY_k_offset_in_tile < k_elements_in_this_physical_tile);
+
+        #pragma unroll
+        for (int i=0; i<4; ++i) { 
+            bool m_guard_XY = (ldg_X_Y_m_guard_bitmask >> i) & 0x1;
+            bool final_guard_XY = k_guard_XY && m_guard_XY;
+
+            LDG32_GUARD_MOV0_PTX(ldg_X_buffer[i], ldg_X_global_base_ptr + ldg_XY_m_offsets_vals[i] * ldx + (ptrdiff_t)current_k_block_start_offset_in_K, final_guard_XY);
+            if (DELTA_XY_COEFF != 0) {
+                LDG32_GUARD_MOV0_PTX(ldg_Y_buffer[i], ldg_Y_global_base_ptr + ldg_XY_m_offsets_vals[i] * ldy + (ptrdiff_t)current_k_block_start_offset_in_K, final_guard_XY);
+                ldg_X_buffer[i] = ldg_X_buffer[i] + delta_coeff * ldg_Y_buffer[i];
+            } else if (!final_guard_XY) { // Ensure zero if out of bounds and no Y to potentially zero it out
+                 ldg_X_buffer[i] = 0.0f;
+            }
+            STS32_PTX(ldg_X_buffer[i], sts_smem_A_addr_u64 + i * (SMEM_A_COLS + SMEM_A_LD_PADDING) * sizeof(float));
         }
-    }
-#pragma unroll
-    for (int i = 0; i < 4; i += 1) { // Store V+epsilon*W to tile_B_fused
-        STS32_PTX(temp_ldg_V_buffer[i], sts_b_addr + sts_b_offsets[i] * sizeof(float));
-    }
-    __syncthreads();
-    // }
 
-    // FRAGMENT LOADING AND COMPUTATION WILL BE MODIFIED IN LATER SUBTASKS
-    // For now, adapt pointers to use tile_A_fused and tile_B_fused
-    float frag_tile_A_fused[2][8];
-    float frag_tile_B_fused[2][8];
+        bool k_guard_VW = (ldg_VW_k_base_thread_group < k_elements_in_this_physical_tile);
+        #pragma unroll
+        for (int i=0; i<4; ++i) { 
+            bool n_guard_VW = (ldg_V_W_n_guard_bitmask >> i) & 0x1;
+            bool final_guard_VW = k_guard_VW && n_guard_VW;
 
-    uint64_t lds_a_addr; // For tile_A_fused
-    uint64_t lds_b_addr; // For tile_B_fused
+            LDG32_GUARD_MOV0_PTX(ldg_V_buffer[i], ldg_V_global_base_ptr + (ptrdiff_t)current_k_block_start_offset_in_K * ldv + ldg_VW_n_offsets_vals[i], final_guard_VW);
+            if (EPSILON_VW_COEFF != 0) {
+                LDG32_GUARD_MOV0_PTX(ldg_W_buffer[i], ldg_W_global_base_ptr + (ptrdiff_t)current_k_block_start_offset_in_K * ldw + ldg_VW_n_offsets_vals[i], final_guard_VW);
+                ldg_V_buffer[i] = ldg_V_buffer[i] + epsilon_coeff * ldg_W_buffer[i];
+            } else if (!final_guard_VW) {
+                ldg_V_buffer[i] = 0.0f;
+            }
+            STS32_PTX(ldg_V_buffer[i], sts_smem_B_addr_u64 + i * 32 * sizeof(float) ); 
+        }
+        __syncthreads();
 
-    int lane_id_mapped_x = 2 * (lane_id / 8) + (lane_id % 2);
-    int lane_id_mapped_y = (lane_id / 2) % 4;
-    int warp_id_mapped_x = 64 * (warp_id % 2);
-    int warp_id_mapped_y = 32 * (warp_id / 2);
+        // --- Compute MMA operations using data from shared memory (previous LDS buffer) ---
+        // LDS buffer is the one NOT currently being written to by STS
+        float* current_lds_tile_A_smem_base = tile_A_fused_smem[(smem_buffer_idx + 1) % 2]; 
+        float* current_lds_tile_B_smem_base = tile_B_fused_smem[(smem_buffer_idx + 1) % 2];
+        
+        uint64_t lds_smem_A_addr_u64, lds_smem_B_addr_u64;
+        
+        int lane_id_mapped_x_lds = 2 * (lane_id / 8) + (lane_id % 2); 
+        int lane_id_mapped_y_lds = (lane_id / 2) % 4; 
+        int warp_id_mapped_x_lds = (N_TILE_SIZE/2) * (warp_id % 2); 
+        int warp_id_mapped_y_lds = (M_TILE_SIZE/4) * (warp_id / 2); 
 
-    int lds_a_start = 4 * lane_id_mapped_y + warp_id_mapped_y;
-    int lds_b_start = 4 * lane_id_mapped_x + warp_id_mapped_x;
-    float* lds_tile_A_fused_ptr = tile_A_fused + lds_a_start;
-    float* lds_tile_B_fused_ptr = tile_B_fused + lds_b_start;
+        // Effective pointers for fragment loading
+        float* lds_A_ptr_for_frag = current_lds_tile_A_smem_base + (warp_id_mapped_y_lds + 4 * lane_id_mapped_y_lds) * (SMEM_A_COLS + SMEM_A_LD_PADDING);
+        float* lds_B_ptr_for_frag = current_lds_tile_B_smem_base + (warp_id_mapped_x_lds + 4 * lane_id_mapped_x_lds); // B is KxN, each thread loads 4 elements of a row of B for its 8x8 computation
 
-    // Convert from generic to .shared state space
-    CVTA_TO_SHARED_PTX(lds_a_addr, lds_tile_A_fused_ptr);
-    CVTA_TO_SHARED_PTX(lds_b_addr, lds_tile_B_fused_ptr);
+        CVTA_TO_SHARED_PTX(lds_smem_A_addr_u64, lds_A_ptr_for_frag);
+        CVTA_TO_SHARED_PTX(lds_smem_B_addr_u64, lds_B_ptr_for_frag); // This points to start of a 4-element group
 
-    // Load first fragments from shared memory
-    // {
-    LDS128_PTX(frag_tile_A_fused[0][0], frag_tile_A_fused[0][1], frag_tile_A_fused[0][2], frag_tile_A_fused[0][3], lds_a_addr);
-    LDS128_PTX(frag_tile_A_fused[0][4],
-               frag_tile_A_fused[0][5],
-               frag_tile_A_fused[0][6],
-               frag_tile_A_fused[0][7],
-               lds_a_addr + 16 * sizeof(float));
-    LDS128_PTX(frag_tile_B_fused[0][0], frag_tile_B_fused[0][1], frag_tile_B_fused[0][2], frag_tile_B_fused[0][3], lds_b_addr);
-    LDS128_PTX(frag_tile_B_fused[0][4],
-               frag_tile_B_fused[0][5],
-               frag_tile_B_fused[0][6],
-               frag_tile_B_fused[0][7],
-               lds_b_addr + 32 * sizeof(float));
-    // }
+        float frag_A[2][8], frag_B[2][8]; 
 
-    // Move global pointers to next blocks
-    ldg_X_global_ptr += first_block_k_size;
-    if constexpr (DELTA != 0) {
-        ldg_Y_global_ptr += first_block_k_size;
-    }
-    ldg_V_global_ptr += first_block_k_size * ldv;
-    if constexpr (EPSILON != 0) {
-        ldg_W_global_ptr += first_block_k_size * ldw;
-    }
+        LDS128_PTX(frag_A[0][0], frag_A[0][1], frag_A[0][2], frag_A[0][3], lds_smem_A_addr_u64);
+        LDS128_PTX(frag_A[0][4], frag_A[0][5], frag_A[0][6], frag_A[0][7], lds_smem_A_addr_u64 + 4 * sizeof(float)); // Corrected offset (16 bytes)
+        
+        LDS128_PTX(frag_B[0][0], frag_B[0][1], frag_B[0][2], frag_B[0][3], lds_smem_B_addr_u64); // Loads B[k][0,1,2,3] for this thread's 8x8 block
+        LDS128_PTX(frag_B[0][4], frag_B[0][5], frag_B[0][6], frag_B[0][7], lds_smem_B_addr_u64 + 4*sizeof(float)); // Loads B[k][4,5,6,7]
 
-    // Switch shared memory buffers
-    sts_a_addr ^= 8192;
-    sts_b_addr ^= 4096;
+        #pragma unroll
+        for (int k_frag_iter = 0; k_frag_iter < K_TILE_SIZE; ++k_frag_iter) {
+            int current_frag_buf_idx = k_frag_iter % 2;
+            int next_frag_buf_idx = (k_frag_iter + 1) % 2;
 
-    // Iterate over k_sub and divide into k_sub_blocks
-    for (int block_k = 0; block_k < n_blocks_k; block_k++) {
+            if (k_frag_iter < K_TILE_SIZE -1) { 
+                 uint64_t next_lds_A_addr_base_for_frag = lds_smem_A_addr_u64 + (k_frag_iter + 1) * sizeof(float); // Base for the next K-slice for this M-row group
+                 LDS128_PTX(frag_A[next_frag_buf_idx][0], frag_A[next_frag_buf_idx][1], frag_A[next_frag_buf_idx][2], frag_A[next_frag_buf_idx][3], next_lds_A_addr_base_for_frag);
+                 LDS128_PTX(frag_A[next_frag_buf_idx][4], frag_A[next_frag_buf_idx][5], frag_A[next_frag_buf_idx][6], frag_A[next_frag_buf_idx][7], next_lds_A_addr_base_for_frag + 4*sizeof(float)); // Corrected offset
 
-        // Prefetch next blocks from global memory (X, Y, V, W)
-        // {
-#pragma unroll
-        for (int i = 0; i < 4; i++) {
-            bool guard_m_XY = (ldg_X_bitmask & (0x1 << i)); // Guard for m_sub dimension
-            LDG32_GUARD_PTX(ldg_X_buffer[i], ldg_X_global_ptr + ldg_X_offsets_global[i], (unsigned)guard_m_XY);
-            if constexpr (DELTA != 0) {
-                LDG32_GUARD_PTX(ldg_Y_buffer[i], ldg_Y_global_ptr + ldg_Y_offsets_global[i], (unsigned)guard_m_XY);
+                 uint64_t next_lds_B_addr_base_for_frag = lds_smem_B_addr_u64 + (k_frag_iter + 1) * (SMEM_B_COLS + SMEM_B_LD_PADDING) * sizeof(float); // Base for the next K-row for this N-col group
+                 LDS128_PTX(frag_B[next_frag_buf_idx][0], frag_B[next_frag_buf_idx][1], frag_B[next_frag_buf_idx][2], frag_B[next_frag_buf_idx][3], next_lds_B_addr_base_for_frag);
+                 LDS128_PTX(frag_B[next_frag_buf_idx][4], frag_B[next_frag_buf_idx][5], frag_B[next_frag_buf_idx][6], frag_B[next_frag_buf_idx][7], next_lds_B_addr + 4*sizeof(float));
             }
 
-            bool guard_n_VW = (ldg_V_bitmask & (0x1 << i)); // Guard for n_sub dimension
-            LDG32_GUARD_PTX(ldg_V_buffer[i], ldg_V_global_ptr + ldg_V_offsets_global[i], (unsigned)guard_n_VW);
-            if constexpr (EPSILON != 0) {
-                LDG32_GUARD_PTX(ldg_W_buffer[i], ldg_W_global_ptr + ldg_W_offsets_global[i], (unsigned)guard_n_VW);
-            }
-        }
-        // }
-
-        // --- CORE COMPUTATION (using frag_a, frag_b from current tile_A_fused, tile_B_fused) ---
-        // --- This part will be significantly modified in a later subtask. ---
-        // --- For now, it's mostly placeholder, using existing loop structure. ---
-#pragma unroll
-        for (int warp_k = 0; warp_k < 8; warp_k += 1) {
-            int prefetch = (warp_k + 1) % 8;
-            int frag_idx = warp_k & 1;
-            int frag_next_idx = (warp_k + 1) & 1;
-
-            // Prefetch next fragments from shared memory
-            // {
-            LDS128_PTX(frag_tile_A_fused[frag_next_idx][0],
-                       frag_tile_A_fused[frag_next_idx][1],
-                       frag_tile_A_fused[frag_next_idx][2],
-                       frag_tile_A_fused[frag_next_idx][3],
-                       lds_a_addr + prefetch * smem_a_ld * sizeof(float)); // lds_a_addr points to tile_A_fused
-            LDS128_PTX(frag_tile_A_fused[frag_next_idx][4],
-                       frag_tile_A_fused[frag_next_idx][5],
-                       frag_tile_A_fused[frag_next_idx][6],
-                       frag_tile_A_fused[frag_next_idx][7],
-                       lds_a_addr + (prefetch * smem_a_ld + 16) * sizeof(float));
-            LDS128_PTX(frag_tile_B_fused[frag_next_idx][0],
-                       frag_tile_B_fused[frag_next_idx][1],
-                       frag_tile_B_fused[frag_next_idx][2],
-                       frag_tile_B_fused[frag_next_idx][3],
-                       lds_b_addr + prefetch * smem_b_ld * sizeof(float)); // lds_b_addr points to tile_B_fused
-            LDS128_PTX(frag_tile_B_fused[frag_next_idx][4],
-                       frag_tile_B_fused[frag_next_idx][5],
-                       frag_tile_B_fused[frag_next_idx][6],
-                       frag_tile_B_fused[frag_next_idx][7],
-                       lds_b_addr + (prefetch * smem_b_ld + 32) * sizeof(float));
-            // }
-
-            // Update the accumulator (placeholder)
-            // {
-#pragma unroll
-            for (int i = 0; i < 8; i++) {
-#pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    accumulator[i][j] += frag_tile_A_fused[frag_idx][i] * frag_tile_B_fused[frag_idx][j];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) { 
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) { 
+                    accumulator[i][j] += frag_A[current_frag_buf_idx][i] * frag_B[current_frag_buf_idx][j];
                 }
             }
-            // }
         }
-        // --- END OF CORE COMPUTATION PLACEHOLDER ---
+        smem_buffer_idx = (smem_buffer_idx + 1) % 2; 
+    } // End K-loop
 
-        // Store prefetched and summed blocks to shared memory (for *next* iteration's use)
-        // This happens *before* __syncthreads() and buffer switch for sts_a_addr/sts_b_addr
-        // {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) { // Prepare data for tile_A_fused (X + delta*Y)
-            if constexpr (DELTA != 0) {
-                temp_ldg_X_buffer[i] = ldg_X_buffer[i] + (float)DELTA * ldg_Y_buffer[i];
-            } else {
-                temp_ldg_X_buffer[i] = ldg_X_buffer[i];
-            }
-        }
-        STS128_PTX(temp_ldg_X_buffer[0], temp_ldg_X_buffer[1], temp_ldg_X_buffer[2], temp_ldg_X_buffer[3], sts_a_addr);
+    // --- Write results from accumulator to Global Memory (D and E matrices) ---
+    float gamma0_val = get_strassen_coeff_val(GAMMA0_DEST_COEFF);
+    float gamma1_val = get_strassen_coeff_val(GAMMA1_DEST_COEFF);
 
-#pragma unroll
-        for (int i = 0; i < 4; ++i) { // Prepare and store data for tile_B_fused (V + epsilon*W)
-            if constexpr (EPSILON != 0) {
-                temp_ldg_V_buffer[i] = ldg_V_buffer[i] + (float)EPSILON * ldg_W_buffer[i];
-            } else {
-                temp_ldg_V_buffer[i] = ldg_V_buffer[i];
-            }
-            STS32_PTX(temp_ldg_V_buffer[i], sts_b_addr + sts_b_offsets[i] * sizeof(float));
-        }
-        __syncthreads(); // Synchronize before switching buffers and loading from new shared mem
-        // }
+    // Output mapping from original sgemm_128x128x8.cuh
+    uint64_t sts_output_smem_addr_base;
+    int sts_output_offset_comp = 512 * warp_id + 4 * 32 * lane_id_mapped_y_lds + 4 * lane_id_mapped_x_lds;
+    CVTA_TO_SHARED_PTX(sts_output_smem_addr_base, smem_buffer + sts_output_offset_comp); // Use start of smem_buffer for output staging
 
-        // Switch shared memory buffers (for storing next prefetched global data)
-        sts_a_addr ^= 8192;
-        sts_b_addr ^= 4096;
-        // Switch shared memory buffers (for loading fragments for computation)
-        lds_a_addr ^= 8192;
-        lds_b_addr ^= 4096;
+    float* lds_output_smem_ptr = (float*)(smem_buffer + 512 * warp_id + lane_id);
 
-        // Move global pointers to next blocks
-        ldg_X_global_ptr += 8; // Each block has a k-depth of 8
-        if constexpr (DELTA != 0) {
-            ldg_Y_global_ptr += 8;
-        }
-        ldg_V_global_ptr += 8 * ldv; // V is indexed k,n so pointer moves by 8 * ldv
-        if constexpr (EPSILON != 0) {
-            ldg_W_global_ptr += 8 * ldw; // W is indexed k,n so pointer moves by 8 * ldw
-        }
+    int out_base_m = blockIdx.y * M_TILE_SIZE + warp_id_mapped_y_lds;
+    int out_base_n = blockIdx.x * N_TILE_SIZE + warp_id_mapped_x_lds;
 
-        // Load first fragments from shared memory
-        // {
-        LDS128_PTX(frag_tile_A_fused[0][0], frag_tile_A_fused[0][1], frag_tile_A_fused[0][2], frag_tile_A_fused[0][3], lds_a_addr);
-        LDS128_PTX(frag_tile_A_fused[0][4],
-                   frag_tile_A_fused[0][5],
-                   frag_tile_A_fused[0][6],
-                   frag_tile_A_fused[0][7],
-                   lds_a_addr + 16 * sizeof(float));
-        LDS128_PTX(frag_tile_B_fused[0][0], frag_tile_B_fused[0][1], frag_tile_B_fused[0][2], frag_tile_B_fused[0][3], lds_b_addr);
-        LDS128_PTX(frag_tile_B_fused[0][4],
-                   frag_tile_B_fused[0][5],
-                   frag_tile_B_fused[0][6],
-                   frag_tile_B_fused[0][7],
-                   lds_b_addr + 32 * sizeof(float));
-        // }
-    }
-
-    // Compute last block
-    // {
-#pragma unroll
-    for (int warp_k = 0; warp_k < 8; warp_k += 1) {
-        int prefetch = (warp_k + 1) % 8;
-        int frag_idx = warp_k & 1;
-        int frag_next_idx = (warp_k + 1) & 1;
-
-        LDS128_PTX(frag_tile_A_fused[frag_next_idx][0],
-                   frag_tile_A_fused[frag_next_idx][1],
-                   frag_tile_A_fused[frag_next_idx][2],
-                   frag_tile_A_fused[frag_next_idx][3],
-                   lds_a_addr + prefetch * smem_a_ld * sizeof(float));
-        LDS128_PTX(frag_tile_A_fused[frag_next_idx][4],
-                   frag_tile_A_fused[frag_next_idx][5],
-                   frag_tile_A_fused[frag_next_idx][6],
-                   frag_tile_A_fused[frag_next_idx][7],
-                   lds_a_addr + (prefetch * smem_a_ld + 16) * sizeof(float));
-        LDS128_PTX(frag_tile_B_fused[frag_next_idx][0],
-                   frag_tile_B_fused[frag_next_idx][1],
-                   frag_tile_B_fused[frag_next_idx][2],
-                   frag_tile_B_fused[frag_next_idx][3],
-                   lds_b_addr + prefetch * smem_b_ld * sizeof(float));
-        LDS128_PTX(frag_tile_B_fused[frag_next_idx][4],
-                   frag_tile_B_fused[frag_next_idx][5],
-                   frag_tile_B_fused[frag_next_idx][6],
-                   frag_tile_B_fused[frag_next_idx][7],
-                   lds_b_addr + (prefetch * smem_b_ld + 32) * sizeof(float));
-
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-#pragma unroll
-            for (int j = 0; j < 8; j++) {
-                accumulator[i][j] += frag_tile_A_fused[frag_idx][i] * frag_tile_B_fused[frag_idx][j];
-            }
-        }
-    }
-    // }
-
-    // Phase 3: Fused Output Accumulation (Registers to Global Memory)
-    // The accumulator[8][8] holds M_tile.
-    // D += gamma0 * M_tile  (where gamma0 is treated as 1.0 via GAMMA0_IS_ONE)
-    // E += gamma1 * M_tile  (where gamma1 is GAMMA1_SIGN)
-
-    // Shared memory region for staging output. Each warp handles 32x32 output region.
-    // Each thread in a warp handles 4x4 from the accumulator.
-    // Staging area: warp_id maps to a 512 float region (smem_ptr + 512 * warp_id).
-    // Within this, lane_id maps to its specific part.
-    // sts_c_addr in original kernel: smem_ptr + 512 * warp_id + 4 * 32 * lane_id_mapped_y + 4 * lane_id_mapped_x
-    // lds_c_ptr in original kernel: (float*)((smem_ptr + 512 * warp_id + lane_id))
-    // The original kernel wrote 16 floats per thread to shared mem (4x STS128 for the warp), then read them back for STG.
-
-    uint64_t output_staging_sts_addr_base;
-    // Each thread is responsible for a 4x4 region of the 8x8 accumulator.
-    // lane_id_mapped_y maps to rows (0..3), lane_id_mapped_x maps to cols (0..7 for 32 threads, then further sub-divided)
-    // For output, each thread handles 4 rows and 1 col from its 4x4 accumulator part per STG iteration.
-    // Let's use a simpler shared memory layout for staging: each thread writes its 16 accumulator values.
-    // Total shared memory for output staging per warp: 32 threads * 16 floats = 512 floats.
-    // This matches the original C output staging area size per warp.
-    float* output_staging_smem_ptr = smem_ptr + 2 * (smem_a_size + smem_b_size); // Use dedicated region after A and B tiles
-                                                                                // Ensure this doesn't exceed total shared mem.
-                                                                                // Original smem_ptr is 2*(smem_a_size+smem_b_size) = 2*(2048+1024) = 6144 floats.
-                                                                                // Max shared mem is typically 48KB (12288 floats) or more.
-                                                                                // Output staging size: 8 warps * 512 floats/warp = 4096 floats.
-                                                                                // Total: tile_A(2*2048) + tile_B(2*1024) + output(4096) = 4096+2048+4096 = 10240 floats. OK.
-
-    float* thread_output_staging_ptr = output_staging_smem_ptr + (threadIdx.x * 16);
-    uint64_t thread_output_staging_addr_64;
-    CVTA_TO_SHARED_PTX(thread_output_staging_addr_64, thread_output_staging_ptr);
-
-    // Stage accumulator values to shared memory
-    // Each thread has 8x8 accumulator, but is responsible for writing a 4x4 portion of the output block per iteration.
-    // The mapping from accumulator[8][8] per thread to the 128x128 output block is complex.
-    // The original mapping:
-    // m_out_idx = blockIdx.y * 128 + warp_id_mapped_y; (base row for the 32x32 warp output)
-    // n_out_idx = blockIdx.x * 128 + warp_id_mapped_x + lane_id; (base col for a single thread's output strip)
-    // This implies each thread writes a strip of 16 elements in m-dim and 1 element in n-dim per p-loop.
-
-    // Staging accumulator[8][8] to shared memory:
-    // Each thread handles 16 elements from its accumulator that map to a 16xm_inputs x 1xn_inputs region.
-    // The accumulator is 8x8. This maps to a 32x32 tile in C per warp.
-    // lane_id_mapped_y = (lane_id/2)%4 -> maps to one of 4 sets of 4 rows in accumulator for this thread
-    // lane_id_mapped_x = 2*(lane_id/8) + (lane_id%2) -> maps to one of 8 sets of 4 cols in accumulator
-    // This means accumulator[i][j] is specific to a thread.
-
-    // Store D_ptr += GAMMA0_IS_ONE * M_tile
-    if constexpr (GAMMA0_IS_ONE != 0) { // GAMMA0_IS_ONE is 1 if gamma0 is 1.0f
-        // Stage accumulator to shared memory (scaled by GAMMA0_IS_ONE, which is 1.0f)
-        // Each thread has its own 8x8 accumulator.
-        // The original code iterates i=0..1, j=0..1, p_sts=0..3, p_stg=0..15
-        // i,j -> select one of four 4x4 sub-blocks of the accumulator.
-        // p_sts -> selects which row within that 4x4 sub-block.
-        // This means sts_c_addr needs to be based on warp_id, lane_id_mapped_x/y to correctly map accumulator.
-        // The original sts_c_addr was: smem_ptr + 512 * warp_id + 4*32*lane_id_mapped_y + 4*lane_id_mapped_x
-        // This is the base for a 4x4 tile in shared mem for this thread's portion of current C sub-block.
-        
-        uint64_t sts_target_smem_addr_base;
-        int sts_offset_comp = 512 * warp_id + 4 * 32 * lane_id_mapped_y + 4 * lane_id_mapped_x;
-        CVTA_TO_SHARED_PTX(sts_target_smem_addr_base, smem_ptr + sts_offset_comp); // Using original C staging area
-
-        float* lds_src_smem_ptr = (float*)(smem_ptr + 512 * warp_id + lane_id); // Aligned with original lds_c_ptr
-
-        int base_m_idx = blockIdx.y * 128 + warp_id_mapped_y; // Base m-index for this warp's 32-row high strip
-        int base_n_idx = blockIdx.x * 128 + warp_id_mapped_x; // Base n-index for this thread group's 32-col wide strip
-
-        if (base_m_idx < m_sub) { // Warp-level check for m-bound
+    if (GAMMA0_DEST_COEFF != 0) {
+        if (out_base_m < m_sub) { 
             #pragma unroll 1
-            for (int i_outer = 0; i_outer < 2; ++i_outer) { // iterates over 2x2 sub-blocks of 64x64 within 128x128 tile
+            for (int i_outer = 0; i_outer < 2; ++i_outer) { 
                 #pragma unroll 1
                 for (int j_outer = 0; j_outer < 2; ++j_outer) {
-                    __syncthreads(); // Sync before STS to shared mem
-                    #pragma unroll 2 // Process 4 rows from accumulator for current sub-block
-                    for (int p_sts = 0; p_sts < 4; ++p_sts) {
-                        // accumulator[row_in_tile_A][col_in_tile_B]
-                        // row_in_tile_A from warp_id_mapped_y and lane_id_mapped_y
-                        // col_in_tile_B from warp_id_mapped_x and lane_id_mapped_x
-                        // This is already handled by accumulator[acc_r][acc_c] being thread-local.
-                        // We need to map i_outer, j_outer, p_sts to acc_r, acc_c
-                        // acc_r = i_outer * 4 + p_sts
-                        // acc_c = j_outer * 4 + {0,1,2,3} for STS128
-                        STS128_PTX(accumulator[i_outer * 4 + p_sts][j_outer * 4 + 0],
-                                   accumulator[i_outer * 4 + p_sts][j_outer * 4 + 1],
-                                   accumulator[i_outer * 4 + p_sts][j_outer * 4 + 2],
-                                   accumulator[i_outer * 4 + p_sts][j_outer * 4 + 3],
-                                   sts_target_smem_addr_base + p_sts * 8 * sizeof(float4)); // Store 4x4 block part
+                    __syncthreads(); 
+                    #pragma unroll 2
+                    for (int p_sts = 0; p_sts < 4; ++p_sts) { 
+                        STS128_PTX(gamma0_val * accumulator[i_outer * 4 + p_sts][j_outer * 4 + 0],
+                                   gamma0_val * accumulator[i_outer * 4 + p_sts][j_outer * 4 + 1],
+                                   gamma0_val * accumulator[i_outer * 4 + p_sts][j_outer * 4 + 2],
+                                   gamma0_val * accumulator[i_outer * 4 + p_sts][j_outer * 4 + 3],
+                                   sts_output_smem_addr_base + p_sts * 8 * sizeof(float4));
                     }
-                    __syncthreads(); // Sync after STS, before STG from shared mem
-
-                    #pragma unroll 4 // Each thread handles 16 rows, 1 column from its sub-block for global store
-                    for (int p_stg = 0; p_stg < 16; ++p_stg) { // p_stg is row within the 16x32 C tile this thread works on
-                        int current_m_offset = base_m_idx + i_outer * 16 + p_stg;
-                        int current_n_offset = base_n_idx + j_outer * 32 + lane_id; // lane_id directly maps to column within 32-wide strip
-                        
-                        bool guard = (current_m_offset < m_sub) && (current_n_offset < n_sub);
-                        
+                    __syncthreads(); 
+                    #pragma unroll 4
+                    for (int p_stg = 0; p_stg < 16; ++p_stg) { 
+                        int current_m = out_base_m + i_outer * 16 + p_stg;
+                        int current_n = out_base_n + j_outer * 32 + lane_id;
+                        bool guard = (current_m < m_sub) && (current_n < n_sub);
                         if (guard) {
-                            float val_m = lds_src_smem_ptr[p_stg * 32]; // Read value staged by this thread
-                                                                       // (or corresponding thread if STS was different)
-                                                                       // Original lds_c_ptr[p*32] suggests each thread reads its own column data
-                                                                       // from shared memory that was written by potentially different threads.
-                                                                       // The STS128 writes 4 floats for a row.
-                                                                       // The LDS by lds_src_smem_ptr[p_stg*32] means thread `lane_id` reads
-                                                                       // the `lane_id`-th float from every 32-float line `p_stg`.
-                                                                       // This matches the original C write pattern.
-
-                            float* d_glob_ptr = D_ptr + current_m_offset * ldd + current_n_offset;
-                            float d_current_val;
+                            float val_to_add = lds_output_smem_ptr[p_stg * 32];
+                            float* d_glob_ptr = D_ptr + (ptrdiff_t)current_m * ldd + current_n;
+                            float d_current_val = 0.0f; // Initialize to 0 before LDG if D_ptr is not pre-initialized with beta*C
                             LDG32_GUARD_MOV0_PTX(d_current_val, d_glob_ptr, guard);
-                            d_current_val += val_m; // GAMMA0_IS_ONE is 1.0f
+                            d_current_val += val_to_add;
                             STG32_GUARD_PTX(d_current_val, d_glob_ptr, guard);
                         }
                     }
@@ -516,49 +291,33 @@ __global__ void strassen_fused_kernel(
         }
     }
 
-    // Store E_ptr += GAMMA1_SIGN * M_tile
-    if constexpr (GAMMA1_SIGN != 0) {
-        uint64_t sts_target_smem_addr_base;
-        int sts_offset_comp = 512 * warp_id + 4 * 32 * lane_id_mapped_y + 4 * lane_id_mapped_x;
-        CVTA_TO_SHARED_PTX(sts_target_smem_addr_base, smem_ptr + sts_offset_comp); // Reuse same C staging area
-
-        float* lds_src_smem_ptr = (float*)(smem_ptr + 512 * warp_id + lane_id);
-
-        int base_m_idx = blockIdx.y * 128 + warp_id_mapped_y;
-        int base_n_idx = blockIdx.x * 128 + warp_id_mapped_x;
-
-        if (base_m_idx < m_sub) { // Warp-level check for m-bound
+    if (GAMMA1_DEST_COEFF != 0) {
+         if (out_base_m < m_sub) { 
             #pragma unroll 1
-            for (int i_outer = 0; i_outer < 2; ++i_outer) {
+            for (int i_outer = 0; i_outer < 2; ++i_outer) { 
                 #pragma unroll 1
                 for (int j_outer = 0; j_outer < 2; ++j_outer) {
                     __syncthreads(); 
                     #pragma unroll 2
-                    for (int p_sts = 0; p_sts < 4; ++p_sts) {
-                        // Scale accumulator values by GAMMA1_SIGN before staging
-                        float acc_val0 = (float)GAMMA1_SIGN * accumulator[i_outer * 4 + p_sts][j_outer * 4 + 0];
-                        float acc_val1 = (float)GAMMA1_SIGN * accumulator[i_outer * 4 + p_sts][j_outer * 4 + 1];
-                        float acc_val2 = (float)GAMMA1_SIGN * accumulator[i_outer * 4 + p_sts][j_outer * 4 + 2];
-                        float acc_val3 = (float)GAMMA1_SIGN * accumulator[i_outer * 4 + p_sts][j_outer * 4 + 3];
-                        STS128_PTX(acc_val0, acc_val1, acc_val2, acc_val3,
-                                   sts_target_smem_addr_base + p_sts * 8 * sizeof(float4));
+                    for (int p_sts = 0; p_sts < 4; ++p_sts) { 
+                        STS128_PTX(gamma1_val * accumulator[i_outer * 4 + p_sts][j_outer * 4 + 0],
+                                   gamma1_val * accumulator[i_outer * 4 + p_sts][j_outer * 4 + 1],
+                                   gamma1_val * accumulator[i_outer * 4 + p_sts][j_outer * 4 + 2],
+                                   gamma1_val * accumulator[i_outer * 4 + p_sts][j_outer * 4 + 3],
+                                   sts_output_smem_addr_base + p_sts * 8 * sizeof(float4));
                     }
                     __syncthreads(); 
-
                     #pragma unroll 4
-                    for (int p_stg = 0; p_stg < 16; ++p_stg) {
-                        int current_m_offset = base_m_idx + i_outer * 16 + p_stg;
-                        int current_n_offset = base_n_idx + j_outer * 32 + lane_id;
-                        
-                        bool guard = (current_m_offset < m_sub) && (current_n_offset < n_sub);
-
+                    for (int p_stg = 0; p_stg < 16; ++p_stg) { 
+                        int current_m = out_base_m + i_outer * 16 + p_stg;
+                        int current_n = out_base_n + j_outer * 32 + lane_id;
+                        bool guard = (current_m < m_sub) && (current_n < n_sub);
                         if (guard) {
-                            float val_m_scaled = lds_src_smem_ptr[p_stg * 32]; // Value is already scaled by GAMMA1_SIGN
-
-                            float* e_glob_ptr = E_ptr + current_m_offset * lde + current_n_offset;
-                            float e_current_val;
+                            float val_to_add = lds_output_smem_ptr[p_stg * 32];
+                            float* e_glob_ptr = E_ptr + (ptrdiff_t)current_m * lde + current_n;
+                            float e_current_val = 0.0f; // Initialize to 0 if E_ptr is not pre-initialized
                             LDG32_GUARD_MOV0_PTX(e_current_val, e_glob_ptr, guard);
-                            e_current_val += val_m_scaled;
+                            e_current_val += val_to_add;
                             STG32_GUARD_PTX(e_current_val, e_glob_ptr, guard);
                         }
                     }
@@ -567,3 +326,5 @@ __global__ void strassen_fused_kernel(
         }
     }
 }
+
+#endif // STRASSEN_FUSED_128X128X8_KERNEL_CUH_
