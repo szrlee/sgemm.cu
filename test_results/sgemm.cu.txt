@@ -1,0 +1,19 @@
+Test #0 Matsize = 64: n_false = 0, n_nan = 0, n_inf = 0
+
+=============== SUMMARY ===============
+PASSED: 1 / 1
+FAILED: 0
+Strassen Test ID=64x64x64_beta0_DEBUG_ONLY M=64 N=64 K=64 beta=0.000000; Result: FAILED; Details: n_false = 2566, n_nan = 0, n_inf = 0
+
+Strassen Test ID=128x128x128_beta0 M=128 N=128 K=128 beta=0.000000; Result: FAILED; Details: n_false = 9860, n_nan = 0, n_inf = 0
+
+Strassen Test ID=256x256x256_beta0 M=256 N=256 K=256 beta=0.000000; Result: FAILED; Details: n_false = 11068, n_nan = 0, n_inf = 0
+
+Strassen Test ID=512x512x512_beta0 M=512 N=512 K=512 beta=0.000000; Result: FAILED; Details: n_false = 15987, n_nan = 0, n_inf = 0
+
+Strassen Test ID=1024x1024x1024_beta0 M=1024 N=1024 K=1024 beta=0.000000; Result: FAILED; Details: n_false = 13868, n_nan = 0, n_inf = 0
+
+
+=============== STRASSEN FUSED SUMMARY ===============
+PASSED: 0 / 5
+SOME STRASSEN TESTS FAILED.

@@ -12,14 +12,16 @@
                      : "l"(ptr), "r"(guard));          \
     }
 
-#define LDG32_GUARD_MOV0_PTX(reg, ptr, guard)          \
-    {                                                  \
-        asm volatile("{.reg .pred p;\n\t"              \
-                     "setp.ne.u32 p, %2, 0;\n\t"       \
-                     "@!p mov.b32 %0, 0;\n\t"          \
-                     "@p ld.global.f32 %0, [%1];}\n\t" \
-                     : "=f"(reg)                       \
-                     : "l"(ptr), "r"(guard));          \
+#define LDG32_GUARD_MOV0_PTX(var, addr, guard)                  \
+    {                                                           \
+        asm volatile("{\n\t .reg .pred p_ldg_guard;\n\t"        \
+                     "setp.ne.u32 p_ldg_guard, %2, 0;\n\t"      \
+                     "mov.f32 %0, 0.0;\n\t"                     \
+                     "@p_ldg_guard ld.global.f32 %0, [%1];\n\t" \
+                     "}\n"                                      \
+                     : "=f"(var)                                \
+                     : "l"(addr), "r"(guard)                    \
+                     : "memory");                               \
     }
 
 #define STS128_PTX(reg0, reg1, reg2, reg3, addr)                               \
@@ -38,6 +40,9 @@
 
 #define STS32_PTX(reg, addr) \
     { asm volatile("st.shared.f32 [%0], %1;\n" : : "l"(addr), "f"(reg)); }
+
+#define LDS32_PTX(reg, addr) \
+    { asm volatile("ld.shared.f32 %0, [%1];\n" : "=f"(reg) : "l"(addr)); }
 
 #define STG32_GUARD_PTX(reg, ptr, guard)                \
     {                                                   \

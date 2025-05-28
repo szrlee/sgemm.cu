@@ -3,54 +3,84 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
-#include "common/helper_cuda.h" // Assumed to have checkCudaErrors
-#include "src/cublas_helpers.cuh"
-#include "src/sgemm_strassen_fused.cuh" // For sgemm_strassen_1level_fused_vP
 
+// Explicit forward declaration to match sgemm_strassen_fused.cuh
+void sgemm_strassen_1level_fused_vP(int m,
+                                    int n,
+                                    int k,
+                                    float alpha_sub,
+                                    const float* d_A_sub,
+                                    int ldA_sub,
+                                    const float* d_B_sub,
+                                    int ldB_sub,
+                                    float beta_sub,
+                                    float* d_C_sub,
+                                    int ldC_sub,
+                                    cublasHandle_t cublas_handle,
+                                    cudaStream_t stream,
+                                    bool is_first_kernel_launch_for_debug = false);
+
+#include "cublas_helpers.cuh"
+#include "helper_cuda.h"            // Assumed to have checkCudaErrors
+#include "sgemm_strassen_fused.cuh" // Moved earlier, provides sgemm_strassen_1level_fused_vP
+
+#include <cstdio>                   // For printf or stderr
+#include <stdexcept>                // For std::runtime_error
 #include <vector>
-#include <cstdio> // For printf or stderr
-#include <stdexcept> // For std::runtime_error
 
 // Basic error checking macros (if not already in helper_cuda.h or to be sure)
 #ifndef CUDA_CHECK
-#define CUDA_CHECK(call)                                                        \
-    do {                                                                        \
-        cudaError_t status = call;                                              \
-        if (status != cudaSuccess) {                                            \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,    \
-                    cudaGetErrorString(status));                                \
-            throw std::runtime_error(cudaGetErrorString(status));               \
-        }                                                                       \
+#define CUDA_CHECK(call)                                          \
+    do {                                                          \
+        cudaError_t status = call;                                \
+        if (status != cudaSuccess) {                              \
+            fprintf(stderr,                                       \
+                    "CUDA error at %s:%d: %s\n",                  \
+                    __FILE__,                                     \
+                    __LINE__,                                     \
+                    cudaGetErrorString(status));                  \
+            throw std::runtime_error(cudaGetErrorString(status)); \
+        }                                                         \
     } while (0)
 #endif
 
 #ifndef CUBLAS_CHECK
-#define CUBLAS_CHECK(call)                                                      \
-    do {                                                                        \
-        cublasStatus_t status = call;                                           \
-        if (status != CUBLAS_STATUS_SUCCESS) {                                  \
-            fprintf(stderr, "cuBLAS error at %s:%d code=%d\n", __FILE__, __LINE__, status);\
-            throw std::runtime_error("cuBLAS error");                           \
-        }                                                                       \
+#define CUBLAS_CHECK(call)                                                                  \
+    do {                                                                                    \
+        cublasStatus_t status = call;                                                       \
+        if (status != CUBLAS_STATUS_SUCCESS) {                                              \
+            fprintf(stderr, "cuBLAS error at %s:%d code=%d\n", __FILE__, __LINE__, status); \
+            throw std::runtime_error("cuBLAS error");                                       \
+        }                                                                                   \
     } while (0)
 #endif
 
 
 // Host function for Hybrid 2-Level Strassen SGEMM (Version C)
-void sgemm_strassen_hybrid_2level_vC(
-    int M, int N, int K,
-    const float host_alpha,
-    const float* A_host_full, int lda_host_full,
-    const float* B_host_full, int ldb_host_full,
-    const float host_beta,
-    float* C_host_result, int ldc_host_full,
-    cublasHandle_t& cublas_handle, 
-    cudaStream_t stream = 0
-) {
+void
+sgemm_strassen_hybrid_2level_vC(int M,
+                                int N,
+                                int K,
+                                const float host_alpha,
+                                const float* A_host_full,
+                                int lda_host_full,
+                                const float* B_host_full,
+                                int ldb_host_full,
+                                const float host_beta,
+                                float* C_host_result,
+                                int ldc_host_full,
+                                cublasHandle_t& cublas_handle,
+                                cudaStream_t stream = 0) {
     // --- Initial Setup ---
     if (M % 4 != 0 || N % 4 != 0 || K % 4 != 0) {
         char err_msg[200];
-        snprintf(err_msg, sizeof(err_msg), "sgemm_strassen_hybrid_2level_vC: M, N, K must be divisible by 4. Got M=%d, N=%d, K=%d", M,N,K);
+        snprintf(
+            err_msg,
+            sizeof(err_msg),
+            "sgemm_strassen_hybrid_2level_vC: M, N, K must be divisible by 4. Got M=%d, N=%d, K=%d",
+            M,
+            N,
+            K);
         fprintf(stderr, "%s\n", err_msg);
         throw std::runtime_error(err_msg);
     }
@@ -60,41 +90,64 @@ void sgemm_strassen_hybrid_2level_vC(
     const int k2 = K / 2;
 
     float *d_A_full = nullptr, *d_B_full = nullptr, *d_C_full = nullptr;
-    float *d_C_temp_for_beta_scaling = nullptr; // For beta scaling if needed
 
     // Device memory allocation
-    CUDA_CHECK(cudaMallocAsync((void**)&d_A_full, (size_t)M * lda_host_full * sizeof(float), stream));
-    CUDA_CHECK(cudaMallocAsync((void**)&d_B_full, (size_t)K * ldb_host_full * sizeof(float), stream));
-    CUDA_CHECK(cudaMallocAsync((void**)&d_C_full, (size_t)M * ldc_host_full * sizeof(float), stream));
+    CUDA_CHECK(
+        cudaMallocAsync((void**)&d_A_full, (size_t)M * lda_host_full * sizeof(float), stream));
+    CUDA_CHECK(
+        cudaMallocAsync((void**)&d_B_full, (size_t)K * ldb_host_full * sizeof(float), stream));
+
+    CUDA_CHECK(
+        cudaMallocAsync((void**)&d_C_full, (size_t)M * ldc_host_full * sizeof(float), stream));
 
     // Copy host_A to d_A_full, host_B to d_B_full
-    CUDA_CHECK(cudaMemcpy2DAsync(d_A_full, lda_host_full * sizeof(float), A_host_full, lda_host_full * sizeof(float), K * sizeof(float), M, cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpy2DAsync(d_B_full, ldb_host_full * sizeof(float), B_host_full, ldb_host_full * sizeof(float), N * sizeof(float), K, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpy2DAsync(d_A_full,
+                                 lda_host_full * sizeof(float),
+                                 A_host_full,
+                                 lda_host_full * sizeof(float),
+                                 K * sizeof(float),
+                                 M,
+                                 cudaMemcpyHostToDevice,
+                                 stream));
+    CUDA_CHECK(cudaMemcpy2DAsync(d_B_full,
+                                 ldb_host_full * sizeof(float),
+                                 B_host_full,
+                                 ldb_host_full * sizeof(float),
+                                 N * sizeof(float),
+                                 K,
+                                 cudaMemcpyHostToDevice,
+                                 stream));
 
     // Initialize d_C_full based on host_beta
     if (host_beta == 0.0f) {
         CUDA_CHECK(cudaMemsetAsync(d_C_full, 0, (size_t)M * ldc_host_full * sizeof(float), stream));
     } else {
-        // Copy C_host_result to d_C_full first (if beta is not 0)
-        CUDA_CHECK(cudaMemcpy2DAsync(d_C_full, ldc_host_full * sizeof(float), C_host_result, ldc_host_full * sizeof(float), N * sizeof(float), M, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(d_C_full,
+                                     ldc_host_full * sizeof(float),
+                                     C_host_result,
+                                     ldc_host_full * sizeof(float),
+                                     N * sizeof(float),
+                                     M,
+                                     cudaMemcpyHostToDevice,
+                                     stream));
         if (host_beta != 1.0f) {
-            // Scale d_C_full by host_beta in-place. cublasSscal scales a vector.
-            // For a matrix, we can treat it as a long vector M*N elements.
-            // However, ldc might mean it's not contiguous.
-            // Using cublasSgeam C = beta*C + 0*C (effectively C = beta*C, in-place if B is C)
-            // This requires C to be both input B and output C.
             const float beta_zero_for_sgeam = 0.0f;
-             // C_full = host_beta * C_full (copied from host) + 0.0 * C_full
-            CUBLAS_CHECK(cublasSgeam(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                     M, N,
-                                     &host_beta, d_C_full, ldc_host_full,
-                                     &beta_zero_for_sgeam, d_C_full, ldc_host_full, // Dummy B, can be same as C if beta_op(B) = 0
-                                     d_C_full, ldc_host_full));
+            CUBLAS_CHECK(cublasSgeam(cublas_handle,
+                                     CUBLAS_OP_N,
+                                     CUBLAS_OP_N,
+                                     M,
+                                     N,
+                                     &host_beta,
+                                     d_C_full,
+                                     ldc_host_full,
+                                     &beta_zero_for_sgeam,
+                                     d_C_full,
+                                     ldc_host_full,
+                                     d_C_full,
+                                     ldc_host_full));
         }
     }
-    // At this point, d_C_full contains beta * C_initial_on_host (or is zero if beta was 0)
 
-    // --- Submatrix Device Pointers ---
     const float* A00_dev = d_A_full;
     const float* A01_dev = d_A_full + k2;
     const float* A10_dev = d_A_full + (size_t)m2 * lda_host_full;
@@ -110,14 +163,16 @@ void sgemm_strassen_hybrid_2level_vC(
     float* C10_dev = d_C_full + (size_t)m2 * ldc_host_full;
     float* C11_dev = d_C_full + (size_t)m2 * ldc_host_full + n2;
 
-    // --- Workspace Allocation (Individual Allocations for Version C) ---
     size_t s_matrix_size_bytes = (size_t)m2 * k2 * sizeof(float);
     size_t t_matrix_size_bytes = (size_t)k2 * n2 * sizeof(float);
     size_t m_matrix_size_bytes = (size_t)m2 * n2 * sizeof(float);
 
-    float *S0_dev = nullptr, *S1_dev = nullptr, *S4_dev = nullptr, *S5_dev = nullptr, *S6_dev = nullptr;
-    float *T0_dev = nullptr, *T2_dev = nullptr, *T3_dev = nullptr, *T5_dev = nullptr, *T6_dev = nullptr;
-    float *M0_dev = nullptr, *M1_dev = nullptr, *M2_dev = nullptr, *M3_dev = nullptr, *M4_dev = nullptr, *M5_dev = nullptr, *M6_dev = nullptr;
+    float *S0_dev = nullptr, *S1_dev = nullptr, *S4_dev = nullptr, *S5_dev = nullptr,
+          *S6_dev = nullptr;
+    float *T0_dev = nullptr, *T2_dev = nullptr, *T3_dev = nullptr, *T5_dev = nullptr,
+          *T6_dev = nullptr;
+    float *M0_dev = nullptr, *M1_dev = nullptr, *M2_dev = nullptr, *M3_dev = nullptr,
+          *M4_dev = nullptr, *M5_dev = nullptr, *M6_dev = nullptr;
 
     CUDA_CHECK(cudaMallocAsync((void**)&S0_dev, s_matrix_size_bytes, stream));
     CUDA_CHECK(cudaMallocAsync((void**)&S1_dev, s_matrix_size_bytes, stream));
@@ -139,104 +194,395 @@ void sgemm_strassen_hybrid_2level_vC(
     CUDA_CHECK(cudaMallocAsync((void**)&M5_dev, m_matrix_size_bytes, stream));
     CUDA_CHECK(cudaMallocAsync((void**)&M6_dev, m_matrix_size_bytes, stream));
 
-    // S2 and S3 are direct pointers to Aij submatrices
     const float* S2_ptr = A00_dev;
     const float* S3_ptr = A11_dev;
-    // T1 and T4 are direct pointers to Bij submatrices
     const float* T1_ptr = B00_dev;
     const float* T4_ptr = B11_dev;
 
-    // --- Compute S_i and T_i terms using cublas_helpers ---
-    // Assuming cublas_helpers functions use the default stream or need update for stream param
-    // For now, let's assume they are okay or a sync is needed if they don't take streams.
-    // If matrix_add_gpu and matrix_subtract_gpu are synchronous or use default stream,
-    // and this function uses a non-default stream, synchronization might be needed.
-    // For this implementation, we assume they will operate correctly on the given stream
-    // if cublasSetStream(handle, stream) is called before these operations.
     CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
 
-    matrix_add_gpu(cublas_handle, m2, k2, A00_dev, lda_host_full, A11_dev, lda_host_full, S0_dev, k2);
-    matrix_add_gpu(cublas_handle, m2, k2, A10_dev, lda_host_full, A11_dev, lda_host_full, S1_dev, k2);
-    matrix_add_gpu(cublas_handle, m2, k2, A00_dev, lda_host_full, A01_dev, lda_host_full, S4_dev, k2);
-    matrix_subtract_gpu(cublas_handle, m2, k2, A10_dev, lda_host_full, A00_dev, lda_host_full, S5_dev, k2);
-    matrix_subtract_gpu(cublas_handle, m2, k2, A01_dev, lda_host_full, A11_dev, lda_host_full, S6_dev, k2);
+    matrix_add_gpu(cublas_handle,
+                   m2,
+                   k2,
+                   A00_dev,
+                   lda_host_full,
+                   A11_dev,
+                   lda_host_full,
+                   S0_dev,
+                   m2,
+                   stream);
+    matrix_add_gpu(cublas_handle,
+                   m2,
+                   k2,
+                   A10_dev,
+                   lda_host_full,
+                   A11_dev,
+                   lda_host_full,
+                   S1_dev,
+                   m2,
+                   stream);
+    matrix_add_gpu(cublas_handle,
+                   m2,
+                   k2,
+                   A00_dev,
+                   lda_host_full,
+                   A01_dev,
+                   lda_host_full,
+                   S4_dev,
+                   m2,
+                   stream);
+    matrix_subtract_gpu(cublas_handle,
+                        m2,
+                        k2,
+                        A10_dev,
+                        lda_host_full,
+                        A00_dev,
+                        lda_host_full,
+                        S5_dev,
+                        m2,
+                        stream);
+    matrix_subtract_gpu(cublas_handle,
+                        m2,
+                        k2,
+                        A01_dev,
+                        lda_host_full,
+                        A11_dev,
+                        lda_host_full,
+                        S6_dev,
+                        m2,
+                        stream);
 
-    matrix_add_gpu(cublas_handle, k2, n2, B00_dev, ldb_host_full, B11_dev, ldb_host_full, T0_dev, n2);
-    matrix_subtract_gpu(cublas_handle, k2, n2, B01_dev, ldb_host_full, B11_dev, ldb_host_full, T2_dev, n2);
-    matrix_subtract_gpu(cublas_handle, k2, n2, B10_dev, ldb_host_full, B00_dev, ldb_host_full, T3_dev, n2);
-    matrix_add_gpu(cublas_handle, k2, n2, B00_dev, ldb_host_full, B01_dev, ldb_host_full, T5_dev, n2);
-    matrix_add_gpu(cublas_handle, k2, n2, B10_dev, ldb_host_full, B11_dev, ldb_host_full, T6_dev, n2);
+    matrix_add_gpu(cublas_handle,
+                   k2,
+                   n2,
+                   B00_dev,
+                   ldb_host_full,
+                   B11_dev,
+                   ldb_host_full,
+                   T0_dev,
+                   k2,
+                   stream);
+    matrix_subtract_gpu(cublas_handle,
+                        k2,
+                        n2,
+                        B01_dev,
+                        ldb_host_full,
+                        B11_dev,
+                        ldb_host_full,
+                        T2_dev,
+                        k2,
+                        stream);
+    matrix_subtract_gpu(cublas_handle,
+                        k2,
+                        n2,
+                        B10_dev,
+                        ldb_host_full,
+                        B00_dev,
+                        ldb_host_full,
+                        T3_dev,
+                        k2,
+                        stream);
+    matrix_add_gpu(cublas_handle,
+                   k2,
+                   n2,
+                   B00_dev,
+                   ldb_host_full,
+                   B01_dev,
+                   ldb_host_full,
+                   T5_dev,
+                   k2,
+                   stream);
+    matrix_add_gpu(cublas_handle,
+                   k2,
+                   n2,
+                   B10_dev,
+                   ldb_host_full,
+                   B11_dev,
+                   ldb_host_full,
+                   T6_dev,
+                   k2,
+                   stream);
 
-    // --- Compute Inner 7 Products (M_i) using 1-Level Fused Strassen ---
-    const float alpha_inner = 1.0f;
-    const float beta_inner = 0.0f; // M_i = S_a * T_b (no accumulation into M_i itself)
+    printf("[HYBRID DEBUG] M0 computation/accumulation SKIPPED. M3 (using cublasSgemm) ENABLED. "
+           "Others disabled.\n");
+    fflush(stdout);
 
-    sgemm_strassen_1level_fused_vP(m2, n2, k2, alpha_inner, S0_dev, k2, T0_dev, n2, beta_inner, M0_dev, n2, cublas_handle, stream);
-    sgemm_strassen_1level_fused_vP(m2, n2, k2, alpha_inner, S1_dev, k2, T1_ptr, ldb_host_full, beta_inner, M1_dev, n2, cublas_handle, stream);
-    sgemm_strassen_1level_fused_vP(m2, n2, k2, alpha_inner, S2_ptr, lda_host_full, T2_dev, n2, beta_inner, M2_dev, n2, cublas_handle, stream);
-    sgemm_strassen_1level_fused_vP(m2, n2, k2, alpha_inner, S3_ptr, lda_host_full, T3_dev, n2, beta_inner, M3_dev, n2, cublas_handle, stream);
-    sgemm_strassen_1level_fused_vP(m2, n2, k2, alpha_inner, S4_dev, k2, T4_ptr, ldb_host_full, beta_inner, M4_dev, n2, cublas_handle, stream);
-    sgemm_strassen_1level_fused_vP(m2, n2, k2, alpha_inner, S5_dev, k2, T5_dev, n2, beta_inner, M5_dev, n2, cublas_handle, stream);
-    sgemm_strassen_1level_fused_vP(m2, n2, k2, alpha_inner, S6_dev, k2, T6_dev, n2, beta_inner, M6_dev, n2, cublas_handle, stream);
-    
-    // Note: sgemm_strassen_1level_fused_vP is refactored to not sync internally.
-    // A single sync after all 7 M_i products might be possible if there are no cross-dependencies for workspace.
-    // However, each M_i is independent. For safety and clarity of stages, can sync after all are launched.
-    CUDA_CHECK(cudaStreamSynchronize(stream)); // Ensure all M_i computations are complete
+    const float const_float_one = 1.0f;
+    const float const_float_zero = 0.0f;
 
-    // --- Combine M_i to form final C submatrices ---
-    // C = alpha * (sum of M_i terms) + beta * C_initial (already in d_C_full)
-    // So we do: C_sub = C_sub + host_alpha * M_i_sub (or -host_alpha * M_i_sub)
-    // This uses matrix_accumulate_scaled_add_gpu: C_io = scale_A * A + C_io (beta_for_C_io=1.0f)
+    // M0 = host_alpha * S0 * T0
+    /* CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, 
+                             m2, n2, k2, 
+                             &host_alpha, 
+                             S0_dev, m2,       
+                             T0_dev, k2,       
+                             &const_float_zero, 
+                             M0_dev, m2        
+                             )); */
+    printf("[HYBRID DEBUG] M0 computation skipped.\n");
+    fflush(stdout);
+
+    // M1 = host_alpha * S1 * T1
+    /* CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                             m2, n2, k2,
+                             &host_alpha,
+                             S1_dev, m2,
+                             T1_ptr, ldb_host_full, 
+                             &const_float_zero,
+                             M1_dev, m2
+                             )); */
+
+    // M2 = host_alpha * S2 * T2
+    /* CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                             m2, n2, k2,
+                             &host_alpha,
+                             S2_ptr, lda_host_full, 
+                             T2_dev, k2,
+                             &const_float_zero,
+                             M2_dev, m2
+                             )); */
+
+    // M3 = host_alpha * S3 * T3
+    CUBLAS_CHECK(cublasSgemm(cublas_handle,
+                             CUBLAS_OP_N,
+                             CUBLAS_OP_N,
+                             m2,
+                             n2,
+                             k2,
+                             &host_alpha,
+                             S3_ptr,
+                             lda_host_full,
+                             T3_dev,
+                             k2,
+                             &const_float_zero,
+                             M3_dev,
+                             m2));
+    printf("[HYBRID DEBUG] M3 computation completed.\n");
+    fflush(stdout);
+
+
+    // M4 = host_alpha * S4 * T4
+    /* CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                             m2, n2, k2,
+                             &host_alpha,
+                             S4_dev, m2,
+                             T4_ptr, ldb_host_full, 
+                             &const_float_zero,
+                             M4_dev, m2
+                             )); */
+
+    // M5 = host_alpha * S5 * T5
+    /* CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                             m2, n2, k2,
+                             &host_alpha,
+                             S5_dev, m2,
+                             T5_dev, k2,
+                             &const_float_zero,
+                             M5_dev, m2
+                             )); */
+
+
+    // M6 = host_alpha * S6 * T6
+    /* CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                             m2, n2, k2,
+                             &host_alpha,
+                             S6_dev, m2,
+                             T6_dev, k2,
+                             &const_float_zero,
+                             M6_dev, m2
+                             )); */
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    printf("[HYBRID DEBUG PRE-SYNC] About to synchronize device before C00_M0 accumulation.\n");
+    fflush(stdout);
 
     // C00 = M0+M3-M4+M6
-    matrix_accumulate_scaled_add_gpu(cublas_handle, m2, n2, host_alpha, M0_dev, n2, C00_dev, ldc_host_full);
-    matrix_accumulate_scaled_add_gpu(cublas_handle, m2, n2, host_alpha, M3_dev, n2, C00_dev, ldc_host_full);
-    matrix_accumulate_scaled_add_gpu(cublas_handle, m2, n2, -host_alpha, M4_dev, n2, C00_dev, ldc_host_full);
-    matrix_accumulate_scaled_add_gpu(cublas_handle, m2, n2, host_alpha, M6_dev, n2, C00_dev, ldc_host_full);
+    printf("[HYBRID DEBUG C00_M0 HELPER] M=%d,N=%d,K=%d. m2=%d,n2=%d. M0_dev=%p, ldM0(n2)=%d. "
+           "C00_dev=%p, ldC00(ldc_host_full)=%d. host_alpha=%f\n",
+           M,
+           N,
+           K,
+           m2,
+           n2,
+           (void*)M0_dev,
+           n2,
+           (void*)C00_dev,
+           ldc_host_full,
+           host_alpha);
+    fflush(stdout);
+    /* matrix_accumulate_scaled_add_gpu(cublas_handle,
+                                     m2,
+                                     n2,
+                                     host_alpha,    
+                                     M0_dev,        
+                                     n2,            
+                                     C00_dev,       
+                                     ldc_host_full, 
+                                     stream); */
+    printf("[HYBRID DEBUG C00_M0 HELPER] Call SKIPPED.\n");
+    fflush(stdout);
 
-    // C01 = M2+M4
-    matrix_accumulate_scaled_add_gpu(cublas_handle, m2, n2, host_alpha, M2_dev, n2, C01_dev, ldc_host_full);
-    matrix_accumulate_scaled_add_gpu(cublas_handle, m2, n2, host_alpha, M4_dev, n2, C01_dev, ldc_host_full);
+    printf("[HYBRID HELPER C00_M3] m2=%d, n2=%d, host_alpha=%f, M3_dev=%p, ldM3=%d, C00_dev=%p, "
+           "ldC00=%d\n",
+           m2,
+           n2,
+           host_alpha,
+           (void*)M3_dev,
+           m2,
+           (void*)C00_dev,
+           ldc_host_full);
+    fflush(stdout);
+    matrix_accumulate_scaled_add_gpu(cublas_handle,
+                                     m2,
+                                     n2,
+                                     host_alpha,
+                                     M3_dev,
+                                     m2,
+                                     C00_dev,
+                                     ldc_host_full,
+                                     stream);
+    printf("[HYBRID HELPER C00_M3] Call completed.\n");
+    fflush(stdout);
 
-    // C10 = M1+M3
-    matrix_accumulate_scaled_add_gpu(cublas_handle, m2, n2, host_alpha, M1_dev, n2, C10_dev, ldc_host_full);
-    matrix_accumulate_scaled_add_gpu(cublas_handle, m2, n2, host_alpha, M3_dev, n2, C10_dev, ldc_host_full);
+    printf("[HYBRID HELPER C00_M4] Accumulation for M4 on C00 (using -host_alpha) currently "
+           "disabled for testing M0/M3.\n");
+    fflush(stdout);
+    /* matrix_accumulate_scaled_add_gpu(cublas_handle,
+                                     m2,
+                                     n2,
+                                     -host_alpha,   
+                                     M4_dev,        
+                                     m2,            // ldM4 should be m2
+                                     C00_dev,       
+                                     ldc_host_full, 
+                                     stream); */
 
-    // C11 = M0-M1+M2+M5
-    matrix_accumulate_scaled_add_gpu(cublas_handle, m2, n2, host_alpha, M0_dev, n2, C11_dev, ldc_host_full);
-    matrix_accumulate_scaled_add_gpu(cublas_handle, m2, n2, -host_alpha, M1_dev, n2, C11_dev, ldc_host_full);
-    matrix_accumulate_scaled_add_gpu(cublas_handle, m2, n2, host_alpha, M2_dev, n2, C11_dev, ldc_host_full);
-    matrix_accumulate_scaled_add_gpu(cublas_handle, m2, n2, host_alpha, M5_dev, n2, C11_dev, ldc_host_full);
+    printf("[HYBRID DEBUG] Accumulation for M6 on C00 currently disabled for testing M0/M3.\n");
+    fflush(stdout);
+    /* matrix_accumulate_scaled_add_gpu(cublas_handle,
+                                     m2,
+                                     n2,
+                                     host_alpha,   
+                                     M6_dev,        
+                                     m2,            // ldM6 should be m2
+                                     C00_dev,       
+                                     ldc_host_full, 
+                                     stream); */
 
-    CUDA_CHECK(cudaStreamSynchronize(stream)); // Ensure C combinations are complete
 
-    // --- Copy Result to Host ---
-    CUDA_CHECK(cudaMemcpy2DAsync(C_host_result, ldc_host_full * sizeof(float), d_C_full, ldc_host_full * sizeof(float), N * sizeof(float), M, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream)); // Ensure final D2H copy is complete
+    printf("[HYBRID DEBUG] Accumulations for C01, C10, C11 currently disabled.\n");
+    fflush(stdout);
+    /* matrix_accumulate_scaled_add_gpu(cublas_handle,
+                                     m2,
+                                     n2,
+                                     host_alpha,
+                                     M2_dev,
+                                     m2, // ldM2
+                                     C01_dev,
+                                     ldc_host_full,
+                                     stream);
+    matrix_accumulate_scaled_add_gpu(cublas_handle,
+                                     m2,
+                                     n2,
+                                     host_alpha,
+                                     M4_dev,
+                                     m2, // ldM4
+                                     C01_dev,
+                                     ldc_host_full,
+                                     stream);
 
-    // --- Cleanup ---
-    CUDA_CHECK(cudaFreeAsync(S0_dev, stream)); CUDA_CHECK(cudaFreeAsync(S1_dev, stream));
-    CUDA_CHECK(cudaFreeAsync(S4_dev, stream)); CUDA_CHECK(cudaFreeAsync(S5_dev, stream));
+    matrix_accumulate_scaled_add_gpu(cublas_handle,
+                                     m2,
+                                     n2,
+                                     host_alpha,
+                                     M1_dev,
+                                     m2, // ldM1
+                                     C10_dev,
+                                     ldc_host_full,
+                                     stream);
+    matrix_accumulate_scaled_add_gpu(cublas_handle,
+                                     m2,
+                                     n2,
+                                     host_alpha,
+                                     M3_dev,
+                                     m2, // ldM3
+                                     C10_dev,
+                                     ldc_host_full,
+                                     stream);
+
+    matrix_accumulate_scaled_add_gpu(cublas_handle,
+                                     m2,
+                                     n2,
+                                     host_alpha,
+                                     M0_dev,
+                                     m2, // ldM0
+                                     C11_dev,
+                                     ldc_host_full,
+                                     stream);
+    matrix_accumulate_scaled_add_gpu(cublas_handle,
+                                     m2,
+                                     n2,
+                                     -host_alpha,
+                                     M1_dev,
+                                     m2, // ldM1
+                                     C11_dev,
+                                     ldc_host_full,
+                                     stream);
+    matrix_accumulate_scaled_add_gpu(cublas_handle,
+                                     m2,
+                                     n2,
+                                     host_alpha,
+                                     M2_dev,
+                                     m2, // ldM2
+                                     C11_dev,
+                                     ldc_host_full,
+                                     stream);
+    matrix_accumulate_scaled_add_gpu(cublas_handle,
+                                     m2,
+                                     n2,
+                                     host_alpha,
+                                     M5_dev,
+                                     m2, // ldM5
+                                     C11_dev,
+                                     ldc_host_full,
+                                     stream); */
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    CUDA_CHECK(cudaMemcpy2DAsync(C_host_result,
+                                 ldc_host_full * sizeof(float),
+                                 d_C_full,
+                                 ldc_host_full * sizeof(float),
+                                 N * sizeof(float),
+                                 M,
+                                 cudaMemcpyDeviceToHost,
+                                 stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    CUDA_CHECK(cudaFreeAsync(S0_dev, stream));
+    CUDA_CHECK(cudaFreeAsync(S1_dev, stream));
+    CUDA_CHECK(cudaFreeAsync(S4_dev, stream));
+    CUDA_CHECK(cudaFreeAsync(S5_dev, stream));
     CUDA_CHECK(cudaFreeAsync(S6_dev, stream));
-    CUDA_CHECK(cudaFreeAsync(T0_dev, stream)); CUDA_CHECK(cudaFreeAsync(T2_dev, stream));
-    CUDA_CHECK(cudaFreeAsync(T3_dev, stream)); CUDA_CHECK(cudaFreeAsync(T5_dev, stream));
+    CUDA_CHECK(cudaFreeAsync(T0_dev, stream));
+    CUDA_CHECK(cudaFreeAsync(T2_dev, stream));
+    CUDA_CHECK(cudaFreeAsync(T3_dev, stream));
+    CUDA_CHECK(cudaFreeAsync(T5_dev, stream));
     CUDA_CHECK(cudaFreeAsync(T6_dev, stream));
-    CUDA_CHECK(cudaFreeAsync(M0_dev, stream)); CUDA_CHECK(cudaFreeAsync(M1_dev, stream));
-    CUDA_CHECK(cudaFreeAsync(M2_dev, stream)); CUDA_CHECK(cudaFreeAsync(M3_dev, stream));
-    CUDA_CHECK(cudaFreeAsync(M4_dev, stream)); CUDA_CHECK(cudaFreeAsync(M5_dev, stream));
+    CUDA_CHECK(cudaFreeAsync(M0_dev, stream));
+    CUDA_CHECK(cudaFreeAsync(M1_dev, stream));
+    CUDA_CHECK(cudaFreeAsync(M2_dev, stream));
+    CUDA_CHECK(cudaFreeAsync(M3_dev, stream));
+    CUDA_CHECK(cudaFreeAsync(M4_dev, stream));
+    CUDA_CHECK(cudaFreeAsync(M5_dev, stream));
     CUDA_CHECK(cudaFreeAsync(M6_dev, stream));
-    
+
     CUDA_CHECK(cudaFreeAsync(d_A_full, stream));
     CUDA_CHECK(cudaFreeAsync(d_B_full, stream));
     CUDA_CHECK(cudaFreeAsync(d_C_full, stream));
-    
-    // A final sync to ensure frees complete if stream is not default,
-    // though technically the stream belongs to the caller.
-    // For robust standalone behavior of this function if it were the top level:
-    if (stream != 0) {
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
+
+    if (stream != 0) { CUDA_CHECK(cudaStreamSynchronize(stream)); }
 }
 
 #endif // SGEMM_HYBRID_2LEVEL_VC_CUH_

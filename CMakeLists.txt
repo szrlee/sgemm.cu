@@ -30,8 +30,26 @@ add_executable(test test.cu)
 set_target_properties(test PROPERTIES CUDA_ARCHITECTURES "${GPUCC}" CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(test -lcudart -lcublas)
 
+add_executable(benchmark_strassen benchmark_strassen.cu)
+set_target_properties(benchmark_strassen PROPERTIES CUDA_ARCHITECTURES "${GPUCC}" CUDA_SEPARABLE_COMPILATION ON)
+target_link_libraries(benchmark_strassen -lcudart -lcublas)
+
+add_executable(test_optimized_strassen test_optimized_strassen.cu)
+set_target_properties(test_optimized_strassen PROPERTIES CUDA_ARCHITECTURES "${GPUCC}" CUDA_SEPARABLE_COMPILATION ON)
+target_link_libraries(test_optimized_strassen -lcudart -lcublas)
+
+add_executable(test_simple_strassen test_simple_strassen.cu)
+set_target_properties(test_simple_strassen PROPERTIES CUDA_ARCHITECTURES "${GPUCC}" CUDA_SEPARABLE_COMPILATION ON)
+target_link_libraries(test_simple_strassen -lcudart -lcublas)
+
+add_executable(benchmark_optimized_strassen benchmark_optimized_strassen.cu)
+set_target_properties(benchmark_optimized_strassen PROPERTIES CUDA_ARCHITECTURES "${GPUCC}" CUDA_SEPARABLE_COMPILATION ON)
+target_link_libraries(benchmark_optimized_strassen -lcudart -lcublas)
+
 target_compile_options(benchmark PRIVATE -DGPUCC=${GPUCC} -DCUBLAS=${CUBLAS})
 target_compile_options(test PRIVATE -DGPUCC=${GPUCC})
+target_compile_options(benchmark_strassen PRIVATE -DGPUCC=${GPUCC})
+target_compile_options(test_optimized_strassen PRIVATE -DGPUCC=${GPUCC})
 
 # target_compile_options(bench PRIVATE --ptxas-options=-v -O3)
 # target_compile_options(test PRIVATE -Xptxas -O3)

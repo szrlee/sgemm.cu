@@ -1,4 +1,4 @@
-#include "helper_cuda ptx.h"
+#include "../../common/helper_cuda_ptx.h"
 #include <cstdint>
 
 __global__
@@ -361,22 +361,34 @@ __launch_bounds__(256, 2) void sgemm_128x128x8(int m,
                     int m_edge = m - (m_idx + i * 16);
                     int n_pos = n_idx + j * 32;
                     bool guard = p < m_edge && n_pos < n;
+
+                    float val_to_store;
+                    uint64_t addr_to_store_at = reinterpret_cast<uint64_t>(
+                        stg_c_ptr + (i * 16 + p) * ldc + j * 32); // ldc was n
+
                     // if (beta != 0.0) {compute (beta*C + accumulator) and write to global memory}
                     if (beta != 0) {
-                        float c;
-                        LDG32_GUARD_MOV0_PTX(c,
-                                             stg_c_ptr + (i * 16 + p) * n + j * 32,
+                        float c_val;
+                        LDG32_GUARD_MOV0_PTX(c_val,
+                                             stg_c_ptr + (i * 16 + p) * ldc + j * 32, // ldc was n
                                              (unsigned)guard);
-                        c *= beta;
-                        STG32_GUARD_PTX(c + lds_c_ptr[p * 32],
-                                        stg_c_ptr + (i * 16 + p) * n + j * 32,
-                                        (unsigned)guard);
+                        c_val *= beta;
+                        val_to_store =
+                            c_val
+                            + lds_c_ptr[p * 32]; // lds_c_ptr is float*, so lds_c_ptr[idx] is float
+                        // Error in original: c + lds_c_ptr used 'c' which was float from LDG, then added another value from smem.
+                        // Assuming lds_c_ptr contains the accumulator part after alpha scaling.
+                        // The original was STG32_GUARD_PTX(c + lds_c_ptr[p*32], ptr, guard)
+                        // c was from global load, lds_c_ptr[p*32] was from shared (where accumulator was put)
+                        // This implies lds_c_ptr should hold the scaled accumulator values.
+                        // And 'c_val' holds beta * C_global. So val_to_store = beta*C_global + Accum_scaled. This seems right.
+                        STG32_GUARD_PTX(val_to_store, addr_to_store_at, (unsigned)guard);
                     }
                     // if (beta == 0.0) {directly store the accumulator to global memory}
                     else {
-                        STG32_GUARD_PTX(lds_c_ptr[p * 32],
-                                        stg_c_ptr + (i * 16 + p) * n + j * 32,
-                                        (unsigned)guard);
+                        val_to_store =
+                            lds_c_ptr[p * 32]; // This should be the scaled accumulator value.
+                        STG32_GUARD_PTX(val_to_store, addr_to_store_at, (unsigned)guard);
                     }
                 }
             }

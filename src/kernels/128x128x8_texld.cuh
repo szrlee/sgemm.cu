@@ -1,4 +1,4 @@
-#include "helper_cuda ptx.h"
+#include "../../common/helper_cuda_ptx.h"
 #include <cstdint>
 
 __global__
@@ -269,19 +269,20 @@ __launch_bounds__(256, 2) void sgemm_texld_128x128x8(int m,
                     int m_edge = m - (m_idx + i * 16);
                     int n_pos = n_idx + j * 32;
                     bool guard = p < m_edge && n_pos < n;
+
+                    float val_to_store;
+                    uint64_t addr_to_store_at = reinterpret_cast<uint64_t>(
+                        stg_c_ptr + (i * 16 + p) * ldc + j * 32);
+
                     if (beta != 0) {
-                        float c;
-                        LDG32_GUARD_MOV0_PTX(c,
-                                             stg_c_ptr + (i * 16 + p) * n + j * 32,
-                                             (unsigned)guard);
-                        c *= beta;
-                        STG32_GUARD_PTX(c + lds_c_ptr[p * 32],
-                                        stg_c_ptr + (i * 16 + p) * n + j * 32,
-                                        (unsigned)guard);
+                        float c_val;
+                        LDG32_GUARD_MOV0_PTX(c_val, addr_to_store_at, (unsigned)guard);
+                        c_val *= beta;
+                        val_to_store = c_val + lds_c_ptr[p * 32];
+                        STG32_GUARD_PTX(val_to_store, addr_to_store_at, (unsigned)guard);
                     } else {
-                        STG32_GUARD_PTX(lds_c_ptr[p * 32],
-                                        stg_c_ptr + (i * 16 + p) * n + j * 32,
-                                        (unsigned)guard);
+                        val_to_store = lds_c_ptr[p * 32];
+                        STG32_GUARD_PTX(val_to_store, addr_to_store_at, (unsigned)guard);
                     }
                 }
             }

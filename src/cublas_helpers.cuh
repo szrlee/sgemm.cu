@@ -2,7 +2,7 @@
 #define CUBLAS_HELPERS_CUH_
 
 #include <cublas_v2.h>
-#include "common/helper_cuda.h" // For CUBLAS_CHECK (now defined in helper_cuda.h)
+#include "helper_cuda.h" // For CUBLAS_CHECK (now defined in helper_cuda.h)
 #include <cuda_runtime.h> // For cudaStream_t
 
 // Wrapper Function 1: matrix_add_gpu
